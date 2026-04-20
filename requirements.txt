@@ -1,0 +1,6 @@
+numpy>=1.23
+scipy>=1.10
+soundfile>=0.12
+librosa>=0.10
+# Optional: enables denoising when PreprocessConfig.denoise=True
+noisereduce>=3.0
