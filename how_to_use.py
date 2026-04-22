@@ -2,7 +2,7 @@ from pathlib import Path
 
 import soundfile as sf
 
-from preprocess import AudioPreprocessor, AugmentationConfig, PreprocessConfig
+from machine_listener.src.preprocess import AudioPreprocessor, AugmentationConfig, PreprocessConfig
 
 
 # 1) Find your project folder and audio file
