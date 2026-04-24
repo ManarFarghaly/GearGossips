@@ -18,14 +18,8 @@ import numpy as np
         128 = frequency axis
         84 = time axis
 """
-def min_max_normalize(S):
-    S_min, S_max = S.min(), S.max()
-    if S_max - S_min == 0:
-        return np.zeros_like(S)
-    else:
-        return (S - S_min) / (S_max - S_min)
+import train_utils as utilis
 
-    
 def calculate_mel_spectrogram(audio_path, n_mels=128, hop_length=512, n_fft=1024, fmin=50, fmax=8000):
     """
     Args:
@@ -45,7 +39,7 @@ def calculate_mel_spectrogram(audio_path, n_mels=128, hop_length=512, n_fft=1024
     
     mel_spectrogram_db = librosa.power_to_db(mel_spectrogram, ref=np.max)
     
-    mel_spectrogram_db = min_max_normalize(mel_spectrogram_db)
+    mel_spectrogram_db = utilis.min_max_normalize(mel_spectrogram_db)
     
     mel_spectrogram_db = mel_spectrogram_db.astype(np.float32)
     

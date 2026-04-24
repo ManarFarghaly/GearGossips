@@ -89,4 +89,10 @@ def compute_metrics(preds, labels):
         "macro_f1": f1_macro,
         "per_class_f1": f1_per_class
     }
-    
+
+def min_max_normalize(S):
+    S_min, S_max = S.min(), S.max()
+    if S_max - S_min == 0:
+        return np.zeros_like(S)
+    else:
+        return (S - S_min) / (S_max - S_min)
