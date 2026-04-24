@@ -7,7 +7,7 @@ from sklearn.model_selection import train_test_split
 
 class MachineDataset(Dataset):
     
-    def __init__(self, root_dir,preprocessor,PreprocessConfig,featurefn,split,augment=False):
+    def __init__(self, root_dir,preprocessor,featurefn,split,augment=False):
         self.root_dir = pathlib.Path(root_dir) # student data dir
         self.preprocessor = preprocessor()
         self.featurefn = featurefn
