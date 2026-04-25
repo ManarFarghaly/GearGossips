@@ -1,38 +1,57 @@
+"""
+Phase 2 — Dual-stream CNN: Mel-Spectrogram + MFCC.
+
+Inputs : mel  (B, 1, 128, 84)   mfcc  (B, 3, 40, 84)
+Output : (B, 6) logits
+
+Architecture:
+  Stream 1 (mel_stream)  → extract_features() → (B, 256)    ← weights from Phase 1
+  Stream 2 (mfcc_stream) → forward()          → (B, 128)    ← trained from scratch
+  Concatenate                                 → (B, 384)
+  FC(384→256) + ReLU + Dropout(0.4)
+  FC(256→6)
+
+Why dual-stream instead of stacking channels?
+  Mel-spec has 128 freq bins; MFCC has 40 bins.
+  Stacking them as channels would force the same conv filters to work on
+  geometrically different grids.  Separate streams let each branch learn
+  its own representations independently, then merge them at the FC level.
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from cnn_baseline import MelCNN
-from cnn_MFCC import MFCC
 
-# Stream 1 (mel-spec):  Input (B, 1, 128, 84)
-#   → same Block 1-4 from MelCNN  → AdaptiveAvgPool → Flatten → (B, 4096) → FC(4096→256)
-# Stream 2 (MFCC+deltas):  Input (B, 3, 40, 84)
-#   → Block A: Conv2d(3→32, 3×3) + BN + ReLU + MaxPool  → (B, 32, 20, 42)
-#   → Block B: Conv2d(32→64, 3×3) + BN + ReLU + MaxPool → (B, 64, 10, 21)
-#   → AdaptiveAvgPool(4,4) → Flatten → (B, 1024) → FC(1024→128)
-# Concatenate: (B, 384)
-# FC(384→256) + ReLU + Dropout(0.4)
-# FC(256→num_classes)
+from machine_listener.src.models.cnn_baseline import MelCNN
+from machine_listener.src.models.cnn_mfcc import MFCCStream
+
 
 class MelMFCCCNN(nn.Module):
-    def __init__(self, num_classes=6):
+
+    def __init__(self, num_classes: int = 6):
         super().__init__()
 
-        self.mel_stream = MelCNN()
-        self.mfcc_stream = MFCC()
+        self.mel_stream  = MelCNN(num_classes=num_classes)   # full model; we use extract_features()
+        self.mfcc_stream = MFCCStream()
 
-        self.fc1 = nn.Linear(256 + 128, 256)
+        # Fusion head — receives concatenated features from both streams
+        self.fc1     = nn.Linear(256 + 128, 256)   # 384 → 256
         self.dropout = nn.Dropout(0.4)
-        self.fc2 = nn.Linear(256, num_classes)
+        self.fc2     = nn.Linear(256, num_classes)  # 256 → 6
 
-    def forward(self, mel, mfcc):
-        m1 = self.mel_stream(mel)    # (B,256)
-        m2 = self.mfcc_stream(mfcc)  # (B,128)
+    def forward(self, mel: torch.Tensor, mfcc: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            mel  : (B, 1, 128, 84)
+            mfcc : (B, 3, 40,  84)
+        Returns:
+            logits (B, 6)
+        """
+        f_mel  = self.mel_stream.extract_features(mel)   # (B, 256)
+        f_mfcc = self.mfcc_stream(mfcc)                  # (B, 128)
 
-        x = torch.cat([m1, m2], dim=1)  # (B,384)
-
+        x = torch.cat([f_mel, f_mfcc], dim=1)            # (B, 384)
         x = F.relu(self.fc1(x))
         x = self.dropout(x)
-        x = self.fc2(x)
-
+        x = self.fc2(x)                                   # (B, 6)
         return x

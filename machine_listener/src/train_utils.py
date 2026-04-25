@@ -36,7 +36,7 @@ def eval_epoch(model, loader, criterion, device):
     all_preds = []
     all_labels = []
     for x,y in loader:
-        x,y = x.to_device(),y.to_device()
+        x,y = x.to(device),y.to(device)    # FIX: was x.to_device() — no such method
         out = model(x)
         loss = criterion(out,y)
         total_loss += loss.item()
@@ -67,12 +67,13 @@ def load_checkpoint(path, model, optimizer=None):
     return model, epoch, val_acc
 
 def plot_confusion_matrix(preds, labels, class_names):
-    cm = confusion_matrix(preds,labels)
+    cm = confusion_matrix(labels, preds)
     plt.figure(figsize=(8,6))
     sns.heatmap(cm, annot=True, fmt='d', cmap='Purples', xticklabels=class_names, yticklabels=class_names)
-    plt.ylabel("Predicted")
-    plt.xlabel("True")
+    plt.ylabel("True Label")       
+    plt.xlabel("Predicted Label")
     plt.title("Confusion Matrix")
+    plt.tight_layout()
     plt.show()
 
 def compute_metrics(preds, labels):
