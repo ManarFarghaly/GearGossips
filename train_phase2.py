@@ -12,6 +12,7 @@ What's new vs Phase 1:
 """
 
 import os
+import time
 import random
 import pathlib
 import numpy as np
@@ -268,10 +269,21 @@ for epoch in range(1, EPOCHS + 1):
 print(f"\nBest validation accuracy: {best_val_acc:.4f}")
 
 # ─────────────────────────── TEST EVALUATION ──────────────────────────────────
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │  CHECKPOINT SAVED TO:                                                    │
+# │    machine_listener/outputs/saved_models/phase2_best.pth                 │
+# │  Keys stored: model_state_dict · optimizer_state_dict · epoch · val_acc  │
+# │  This file is loaded by train_phase3.py as PHASE2_CKPT.                  │
+# └──────────────────────────────────────────────────────────────────────────┘
 ckpt = torch.load(ckpt_path, map_location=DEVICE)
 model.load_state_dict(ckpt["model_state_dict"])
 
+t0 = time.time()
 _, test_acc, test_preds, test_labels = eval_epoch_dual(model, test_loader, criterion, DEVICE)
+t_test = time.time() - t0
+n_test = len(test_ds)
+ms_per_sample = (t_test / n_test) * 1000   # milliseconds per sample
+
 metrics = utils.compute_metrics(test_preds, test_labels)
 
 print(f"\n── Test Results ─────────────────────────────────────────────")
@@ -279,6 +291,15 @@ print(f"Test Accuracy : {metrics['accuracy']:.4f}")
 print(f"Test Macro F1 : {metrics['macro_f1']:.4f}")
 print()
 print(classification_report(test_labels, test_preds, target_names=CLASS_NAMES))
+
+print(f"\n── Inference Timing ─────────────────────────────────────────")
+print(f"Test set size         : {n_test} samples")
+print(f"Total inference time  : {t_test:.2f} s")
+print(f"Per-sample time       : {ms_per_sample:.3f} ms  →  {1000/ms_per_sample:.0f} samples/sec")
+print(f"Estimated   100 files : {ms_per_sample *   100 / 1000:.2f} s")
+print(f"Estimated 1 000 files : {ms_per_sample *  1000 / 1000:.2f} s")
+print(f"Estimated 10 000 files: {ms_per_sample * 10000 / 1000:.2f} s")
+
 utils.plot_confusion_matrix(test_preds, test_labels, CLASS_NAMES)
 
 # ─────────────────────────── TRAINING CURVES ──────────────────────────────────

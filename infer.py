@@ -21,12 +21,12 @@ import soundfile as sf
 from scipy.signal import resample_poly
 from dataclasses import dataclass, field
 
-# ── PATHS ─────────────────────────────────────────────────────────────────────
+#  PATHS 
 HERE        = pathlib.Path(__file__).parent
 MODEL_PATH  = HERE / "phase3_best.pth"
 SCALER_PATH = HERE / "stat_scaler.pkl"
 
-# ── PREPROCESSING ─────────────────────────────────────────────────────────────
+#  PREPROCESSING 
 EPSILON = 1e-8
 
 @dataclass
@@ -67,7 +67,7 @@ class AudioPreprocessor:
         np.clip(w,-cfg.clip_value,cfg.clip_value,out=w)
         return w.astype(np.float32)
 
-# ── FEATURE FUNCTIONS ─────────────────────────────────────────────────────────
+#  FEATURE FUNCTIONS ─
 def _mm(S):
     lo,hi=S.min(),S.max()
     return np.zeros_like(S) if hi-lo<1e-8 else (S-lo)/(hi-lo)
@@ -94,7 +94,7 @@ def compute_statistical_features(w, sr=16000, feature_names=None):
         elif name=="bandwidth":result.append(float(librosa.feature.spectral_bandwidth(y=w,sr=sr).mean()))
     return np.array(result,dtype=np.float32)
 
-# ── MODELS (must match Phase 3 architecture exactly) ─────────────────────────
+#  MODELS (must match Phase 3 architecture exactly) ─
 class MelCNN(nn.Module):
     def __init__(self,num_classes=6):
         super().__init__()
@@ -125,12 +125,12 @@ class MelMFCCStatCNN(nn.Module):
         f_mel=self.mel_stream.extract_features(mel); f_mfcc=self.mfcc_stream(mfcc); f_stat=self.stat_branch(stat)
         return self.fc2(self.dropout(F.relu(self.fc1(torch.cat([f_mel,f_mfcc,f_stat],dim=1)))))
 
-# ── NUMERIC FILE SORTING ──────────────────────────────────────────────────────
+#  NUMERIC FILE SORTING 
 def numeric_key(path):
     m=re.search(r"\d+",path.stem)
     return int(m.group()) if m else 0
 
-# ── MAIN ──────────────────────────────────────────────────────────────────────
+#  MAIN ─
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: python infer.py <data_directory>"); sys.exit(1)

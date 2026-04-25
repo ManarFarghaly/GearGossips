@@ -13,7 +13,7 @@ Output: phase3_best.pth + stat_scaler.pkl → /kaggle/working
 
 """
 
-import os, json, math, pathlib, random
+import os, json, math, pathlib, random, time
 import numpy as np
 import torch
 import torch.nn as nn
@@ -509,13 +509,37 @@ for epoch in range(1,FINETUNE_EPOCHS+1):
     print()
 
 print(f"\nBest val accuracy: {best_vl_f:.4f}")
+
+# ┌──────────────────────────────────────────────────────────────────────┐
+# │  CHECKPOINTS SAVED TO:  /kaggle/working/                             │
+# │    phase3_best.pth   — model weights + stat_features + stat_dim      │
+# │    stat_scaler.pkl   — {"mean", "std", "features"} for inference     │
+# │  Both files are needed together at inference time.                   │
+# └──────────────────────────────────────────────────────────────────────┘
 ckpt=torch.load(os.path.join(MODELS_DIR,"phase3_best.pth"),map_location=DEVICE)
 model_f.load_state_dict(ckpt["model_state_dict"])
+
+t0 = time.time()
 _,ta,preds,labels=eval_epoch3(model_f,te_ldr,criterion_f,DEVICE,scaler_mean_f,scaler_std_f)
-print(f"\nTest accuracy : {ta:.4f}")
+t_test = time.time() - t0
+n_test = len(test_ds_f)
+ms_per_sample = (t_test / n_test) * 1000   # milliseconds per sample
+
+print(f"\n── Test Results ──────────────────────────────────────────")
+print(f"Test accuracy : {ta:.4f}")
 print(f"Macro F1      : {f1_score(labels,preds,average='macro'):.4f}")
+print(f"Stat features : {best_feat}")
 print("\n",classification_report(labels,preds,target_names=CLASS_NAMES))
+
+print(f"\n── Inference Timing ──────────────────────────────────────")
+print(f"Test set size         : {n_test} samples")
+print(f"Total inference time  : {t_test:.2f} s")
+print(f"Per-sample time       : {ms_per_sample:.3f} ms  →  {1000/ms_per_sample:.0f} samples/sec")
+print(f"Estimated   100 files : {ms_per_sample *   100 / 1000:.2f} s")
+print(f"Estimated 1 000 files : {ms_per_sample *  1000 / 1000:.2f} s")
+print(f"Estimated 10 000 files: {ms_per_sample * 10000 / 1000:.2f} s")
+
 cm=confusion_matrix(labels,preds)
 plt.figure(figsize=(8,6)); sns.heatmap(cm,annot=True,fmt="d",cmap="Purples",xticklabels=CLASS_NAMES,yticklabels=CLASS_NAMES)
 plt.ylabel("True Label"); plt.xlabel("Predicted Label"); plt.tight_layout(); plt.show()
-print(f"\nFiles saved: phase3_best.pth, stat_scaler.pkl")
+print(f"\nFiles saved: phase3_best.pth, stat_scaler.pkl  → /kaggle/working/")

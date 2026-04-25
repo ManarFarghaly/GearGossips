@@ -1,15 +1,17 @@
 """
 PHASE 1 — Mel-Spectrogram → 2D CNN Baseline                 
-Paste this entire file into a Kaggle notebook cell.                                                                   
 Before running:                                             
-    1. Upload your 'Students' folder as a Kaggle dataset      
+    1. Upload Machine-Fault-Dataset a Kaggle dataset into input    
     2. Set ROOT_DIR below to the correct /kaggle/input/ path  
     3. GPU must be ON (Settings → Accelerator → GPU T4 x2)                                                              
 Output: phase1_best.pth saved to /kaggle/working/           
         Download it and upload as a dataset for Phase 2     
-
 """
+import shutil
 
+shutil.make_archive("/kaggle/working/output", 'zip', "/kaggle/working")
+
+print("Zipped everything to /kaggle/working/output.zip")                    # → lists everything in working dir
 
 #  0. Install / imports 
 import os, json, math, re, pathlib, time
@@ -516,19 +518,39 @@ for epoch in range(1, EPOCHS + 1):
 print(f"\nBest val accuracy: {best_val_acc:.4f}")
 
 # ── 8. FINAL EVALUATION on test set ──────────────────────────────────────────
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  CHECKPOINT SAVED TO:  /kaggle/working/phase1_best.pth          │
+# │  Keys stored: model_state_dict · optimizer_state_dict ·         │
+# │               epoch · val_acc                                   │
+# │  → Download from Kaggle Output tab, upload as a new dataset,    │
+# │    then set  PHASE1_CKPT  in kaggle_phase2.py.                  │
+# └─────────────────────────────────────────────────────────────────┘
 ckpt      = torch.load(os.path.join(MODELS_DIR, "phase1_best.pth"), map_location=DEVICE)
 model.load_state_dict(ckpt["model_state_dict"])
 
+t0 = time.time()
 _, test_acc, test_preds, test_labels = eval_epoch(model, test_loader, criterion, DEVICE)
+t_test = time.time() - t0
+n_test = len(test_ds)
+ms_per_sample = (t_test / n_test) * 1000   # milliseconds per sample
+
 metrics = compute_metrics(test_preds, test_labels)
 
 print(f"\n── Test Results ──────────────────────────────────────────")
 print(f"Accuracy : {metrics['accuracy']:.4f}")
 print(f"Macro F1 : {metrics['macro_f1']:.4f}")
 print("\nPer-class F1:")
-for i, (name, f1) in enumerate(zip(CLASS_NAMES, metrics["per_class_f1"])):
-    print(f"  {name}: {f1:.4f}")
+for i, (cls_name, f1) in enumerate(zip(CLASS_NAMES, metrics["per_class_f1"])):
+    print(f"  {cls_name}: {f1:.4f}")
 print("\n", classification_report(test_labels, test_preds, target_names=CLASS_NAMES))
+
+print(f"\n── Inference Timing ──────────────────────────────────────")
+print(f"Test set size         : {n_test} samples")
+print(f"Total inference time  : {t_test:.2f} s")
+print(f"Per-sample time       : {ms_per_sample:.3f} ms  →  {1000/ms_per_sample:.0f} samples/sec")
+print(f"Estimated   100 files : {ms_per_sample *   100 / 1000:.2f} s")
+print(f"Estimated 1 000 files : {ms_per_sample *  1000 / 1000:.2f} s")
+print(f"Estimated 10 000 files: {ms_per_sample * 10000 / 1000:.2f} s")
 
 plot_confusion_matrix(test_preds, test_labels, CLASS_NAMES)
 

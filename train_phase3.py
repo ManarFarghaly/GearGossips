@@ -11,7 +11,7 @@ What's new vs Phase 2:
   - StandardScaler normalises stat features (each feature has a very different scale)
 """
 
-import os, pickle
+import os, pickle, time
 import random
 import numpy as np
 import torch
@@ -416,10 +416,22 @@ for epoch in range(1, FINETUNE_EPOCHS + 1):
 print(f"\nBest validation accuracy: {best_vl_f:.4f}")
 
 # ─────────────────────────── TEST EVALUATION ──────────────────────────────────
+# ┌──────────────────────────────────────────────────────────────────────────────┐
+# │  CHECKPOINTS SAVED TO:                                                       │
+# │    machine_listener/outputs/saved_models/phase3_best.pth                     │
+# │      Keys: model_state_dict · epoch · val_acc · stat_features · stat_dim     │
+# │    machine_listener/outputs/saved_models/stat_scaler.pkl                     │
+# │      Keys: mean · std · features  (needed at inference time for stat branch) │
+# └──────────────────────────────────────────────────────────────────────────────┘
 ckpt = torch.load(ckpt_path, map_location=DEVICE)
 model_f.load_state_dict(ckpt["model_state_dict"])
 
+t0 = time.time()
 _, ta, preds, labels = eval_epoch3(model_f, te_ldr, crit_f, DEVICE, s_mean_f, s_std_f)
+t_test = time.time() - t0
+n_test = len(test_ds_f)
+ms_per_sample = (t_test / n_test) * 1000   # milliseconds per sample
+
 metrics = utils.compute_metrics(preds, labels)
 
 print(f"\n── Test Results ──────────────────────────────────────────────")
@@ -428,6 +440,15 @@ print(f"Test Macro F1 : {metrics['macro_f1']:.4f}")
 print(f"Stat features : {best_feat}")
 print()
 print(classification_report(labels, preds, target_names=CLASS_NAMES))
+
+print(f"\n── Inference Timing ─────────────────────────────────────────")
+print(f"Test set size         : {n_test} samples")
+print(f"Total inference time  : {t_test:.2f} s")
+print(f"Per-sample time       : {ms_per_sample:.3f} ms  →  {1000/ms_per_sample:.0f} samples/sec")
+print(f"Estimated   100 files : {ms_per_sample *   100 / 1000:.2f} s")
+print(f"Estimated 1 000 files : {ms_per_sample *  1000 / 1000:.2f} s")
+print(f"Estimated 10 000 files: {ms_per_sample * 10000 / 1000:.2f} s")
+
 utils.plot_confusion_matrix(preds, labels, CLASS_NAMES)
 
 print(f"\nSaved: {ckpt_path}")
