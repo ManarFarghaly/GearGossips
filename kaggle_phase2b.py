@@ -1,30 +1,32 @@
 """
-PHASE 2b — Mel-Spectrogram + Statistical Features (no MFCC)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Purpose:
-  Test whether a lighter model (Mel + 5 global statistics, no MFCC CNN)
-  can match Phase 2 accuracy at roughly the same inference cost as Phase 1.
+Phase 2b — Mel-Spectrogram + Statistical Features (no MFCC)
 
-  Phase 1  : Mel only              ~0.24 ms/sample   99.80%
-  Phase 2  : Mel + MFCC            ~0.49 ms/sample   99.91%  (2× slower)
-  Phase 2b : Mel + Statistical     ~0.25 ms/sample   TBD     (this script)
+A lighter alternative to Phase 2 — skips the MFCC CNN entirely and adds
+a small FC branch for 5 global statistics instead.
+
+  Phase 1  : Mel only          ~0.24 ms/sample   99.80%
+  Phase 2  : Mel + MFCC        ~0.49 ms/sample   99.91%  (2× slower)
+  Phase 2b : Mel + Stat        ~0.25 ms/sample   TBD     (this script)
+
+Features used: rms, zcr, rolloff, bandwidth, kurtosis  (no centroid)
+  Centroid dropped — redundant with the mel CNN's frequency representations.
+  Kurtosis added — standard fault indicator; impulsive signals spike high.
+
+No ablation here. Phase 3 already validated which features help.
 
 Pipeline:
-  1. Pre-compute mel-specs (reuse Phase 1 cache if already there)
-     + compute 5 global stat features per file  (~5 min total, fast)
-  2. Ablation: 5 stat configs with CNN frozen (10 epochs each, ~5 min each)
-  3. Final fine-tune: best stat config, unfreeze all (20 epochs, ~1 hr)
-  4. Save: phase2b_best.pth + stat_scaler_2b.pkl → /kaggle/working/
+  1. Precompute mel (reuse Phase 1 cache) + stat_v2 features once
+  2. Direct fine-tune: 25 epochs with differential LRs
+  3. Save phase2b_best.pth + stat_scaler_2b.pkl
 
 Before running:
-  1. Add machine-fault dataset (same as Phase 1 & 2)
-  2. Download phase1_best.pth from Phase 1's output
-     → upload it as a Kaggle dataset (e.g. "phase1ckpt")
-     → add that dataset to this notebook
+  1. Add machine-fault dataset (same as Phase 1)
+  2. Upload phase1_best.pth as a Kaggle dataset (e.g. "phase1ckpt")
   3. Set PHASE1_CKPT below if your dataset name differs
 """
 
 import os, json, math, pathlib, random, time, pickle
+from scipy.stats import kurtosis as scipy_kurtosis
 import numpy as np
 import torch
 import torch.nn as nn
@@ -63,8 +65,8 @@ def _feat_dir(name: str) -> pathlib.Path:
     print(f"[cache] '{name}' not in uploaded datasets → will compute to {working}")
     return working
 
-FEATS_DIR_MEL  = _feat_dir("feats_mel")   # reuse from Phase 1 cache if available
-FEATS_DIR_STAT = _feat_dir("feats_stat")  # new for this phase
+FEATS_DIR_MEL  = _feat_dir("feats_mel")      # reuse Phase 1 cache if available
+FEATS_DIR_STAT = _feat_dir("feats_stat_v2")  # 5-element: rms, zcr, rolloff, bandwidth, kurtosis
 
 print(f"ROOT_DIR    : {ROOT_DIR}")
 print(f"PHASE1_CKPT : {PHASE1_CKPT}")
@@ -74,22 +76,15 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Device:", DEVICE)
 
 SR = 16000; DURATION_SEC = 2.75; BATCH_SIZE = 32
-NUM_WORKERS     = 4
-ABLATION_EPOCHS = 10   # fast: CNN frozen
-FINETUNE_EPOCHS = 20   # full end-to-end
+NUM_WORKERS  = 4
+TRAIN_EPOCHS = 25   # single run, differential LRs warm up the stat branch naturally
 
 CLASS_NAMES = ["Machine1_Normal","Machine1_Abnormal","Machine2_Normal",
                "Machine2_Abnormal","Machine3_Normal","Machine3_Abnormal"]
 
-ALL_STAT_NAMES = ["rms","zcr","centroid","rolloff","bandwidth"]
-
-ABLATION_CONFIGS = [
-    {"name": "rms_only",                    "features": ["rms"]},
-    {"name": "rms_zcr",                     "features": ["rms","zcr"]},
-    {"name": "rms_zcr_centroid",            "features": ["rms","zcr","centroid"]},
-    {"name": "rms_zcr_centroid_rolloff",    "features": ["rms","zcr","centroid","rolloff"]},
-    {"name": "all_five",                    "features": ["rms","zcr","centroid","rolloff","bandwidth"]},
-]
+# Fixed feature set — no ablation needed, Phase 3 already validated these
+STAT_FEATURES = ["rms", "zcr", "rolloff", "bandwidth", "kurtosis"]
+STAT_COL      = {"rms": 0, "zcr": 1, "rolloff": 2, "bandwidth": 3, "kurtosis": 4}
 
 # ── PREPROCESSING (inline — no external package imports needed) ────────────────
 EPSILON = 1e-8
@@ -176,17 +171,15 @@ def compute_mel_spectrogram(waveform, sr=16000):
     mel=librosa.feature.melspectrogram(y=waveform,sr=sr,n_mels=128,n_fft=1024,hop_length=512,fmin=50,fmax=8000,center=False)
     return np.expand_dims(_mm(librosa.power_to_db(mel,ref=np.max)).astype(np.float32),0)
 
-def compute_statistical_features(waveform, sr=16000, feature_names=None):
-    """waveform → np.ndarray (N,)  — raw unscaled values"""
-    if feature_names is None: feature_names = ALL_STAT_NAMES
-    result=[]
-    for name in feature_names:
-        if name=="rms":        result.append(float(np.sqrt(np.mean(waveform**2))))
-        elif name=="zcr":      result.append(float(librosa.feature.zero_crossing_rate(waveform).mean()))
-        elif name=="centroid": result.append(float(librosa.feature.spectral_centroid(y=waveform,sr=sr).mean()))
-        elif name=="rolloff":  result.append(float(librosa.feature.spectral_rolloff(y=waveform,sr=sr).mean()))
-        elif name=="bandwidth":result.append(float(librosa.feature.spectral_bandwidth(y=waveform,sr=sr).mean()))
-    return np.array(result,dtype=np.float32)
+def compute_stat_v2(waveform, sr=16000):
+    """5 features in canonical order: [rms, zcr, rolloff, bandwidth, kurtosis]. No centroid."""
+    return np.array([
+        float(np.sqrt(np.mean(waveform ** 2))),
+        float(librosa.feature.zero_crossing_rate(waveform).mean()),
+        float(librosa.feature.spectral_rolloff(y=waveform, sr=sr).mean()),
+        float(librosa.feature.spectral_bandwidth(y=waveform, sr=sr).mean()),
+        float(scipy_kurtosis(waveform, fisher=True)),
+    ], dtype=np.float32)
 
 def spec_augment(mel, freq_mask=30, time_mask=15, n_freq=2, n_time=2):
     mel=mel.clone(); _,F,T=mel.shape
@@ -203,7 +196,6 @@ def spec_augment(mel, freq_mask=30, time_mask=15, n_freq=2, n_time=2):
 #   The stat array stores ALL 5 features; ablation slices the relevant columns.
 
 def _precompute_one_mel_stat(args):
-    """Top-level worker: save mel (1,128,84) and all-5 stat (5,) for one wav."""
     idx, wav_path, mel_dir, stat_dir, preprocessor = args
     mel_out  = pathlib.Path(mel_dir)  / f"{idx:06d}.npy"
     stat_out = pathlib.Path(stat_dir) / f"{idx:06d}.npy"
@@ -211,13 +203,11 @@ def _precompute_one_mel_stat(args):
         return
     try:
         w = preprocessor.preprocess(str(wav_path), mode="inference")
-        if not mel_out.exists():
-            np.save(mel_out,  compute_mel_spectrogram(w))
-        if not stat_out.exists():
-            np.save(stat_out, compute_statistical_features(w))
+        if not mel_out.exists():  np.save(mel_out,  compute_mel_spectrogram(w))
+        if not stat_out.exists(): np.save(stat_out, compute_stat_v2(w))
     except Exception:
-        if not mel_out.exists():  np.save(mel_out,  np.zeros((1,128,84), dtype=np.float32))
-        if not stat_out.exists(): np.save(stat_out, np.zeros(5,           dtype=np.float32))
+        if not mel_out.exists():  np.save(mel_out,  np.zeros((1, 128, 84), dtype=np.float32))
+        if not stat_out.exists(): np.save(stat_out, np.zeros(5,             dtype=np.float32))
 
 def precompute_all_mel_stat(paths, mel_dir, stat_dir, preprocessor, n_workers=4):
     import multiprocessing, tqdm as tqdm_module
@@ -279,20 +269,22 @@ class MachineDataset(Dataset):
                torch.tensor(self.labels[ri],dtype=torch.long)
 
 class PrecomputedDatasetMS(Dataset):
-    """Loads pre-computed mel .npy + slices stat from all-5 .npy. SpecAugment on mel at train time."""
-    def __init__(self, mel_dir, stat_dir, labels, indices, stat_feature_names, augment=False):
-        self.mel_dir   = pathlib.Path(mel_dir)
-        self.stat_dir  = pathlib.Path(stat_dir)
-        self.labels    = labels; self.indices = indices; self.augment = augment
-        # Column indices into the 5-element array for the selected feature subset
-        self.stat_cols = [ALL_STAT_NAMES.index(n) for n in stat_feature_names]
+    """Loads mel + stat from .npy. Stat is the full 5-element stat_v2 vector — no slicing needed."""
+    def __init__(self, mel_dir, stat_dir, labels, indices, augment=False):
+        self.mel_dir  = pathlib.Path(mel_dir)
+        self.stat_dir = pathlib.Path(stat_dir)
+        self.labels   = labels
+        self.indices  = indices
+        self.augment  = augment
+
     def __len__(self): return len(self.indices)
+
     def __getitem__(self, idx):
         ri   = self.indices[idx]
         mel  = torch.tensor(np.load(self.mel_dir  / f"{ri:06d}.npy"), dtype=torch.float32)
-        stat_all = np.load(self.stat_dir / f"{ri:06d}.npy")           # (5,)
-        stat = torch.tensor(stat_all[self.stat_cols], dtype=torch.float32)
-        if self.augment: mel = spec_augment(mel)
+        stat = torch.tensor(np.load(self.stat_dir / f"{ri:06d}.npy"), dtype=torch.float32)  # (5,)
+        if self.augment:
+            mel = spec_augment(mel)
         return (mel, stat), torch.tensor(self.labels[ri], dtype=torch.long)
 
 def collate_ms(batch):
@@ -352,10 +344,10 @@ def eval_epoch_ms(model,loader,criterion,device,sm,ss):
             ap.extend(preds.cpu().numpy()); al.extend(y.cpu().numpy())
     return tl/len(loader),cor/tot,ap,al
 
-def fit_scaler(dataset):
-    all_stat=[dataset[i][0][1].numpy() for i in range(len(dataset))]
-    arr=np.stack(all_stat,axis=0)
-    return arr.mean(0), arr.std(0)+1e-8
+def fit_scaler(stat_dir, indices):
+    """Load stat .npy files directly — no wav reads, runs in seconds."""
+    arr = np.stack([np.load(pathlib.Path(stat_dir) / f"{i:06d}.npy") for i in indices])
+    return arr.mean(0), arr.std(0) + 1e-8
 
 def save_ckpt(model,epoch,val_acc,path,stat_features,stat_dim):
     torch.save({"model_state_dict":model.state_dict(),"epoch":epoch,"val_acc":val_acc,
@@ -390,107 +382,53 @@ _splits = json.load(open(pathlib.Path(MODELS_DIR) / "split_indices.json"))
 
 label_counts  = np.bincount([ALL_LABELS[i] for i in _splits["train"]], minlength=6)
 class_weights = torch.tensor(1.0/(label_counts+1), dtype=torch.float32).to(DEVICE)
-print(f"Label counts: {label_counts}")
 
-# ── ABLATION STUDY — CNN frozen, one stat feature added at a time ──────────────
-print("\n══════════════════════════════════════════════════════════════")
-print("  ABLATION STUDY — CNN frozen, stat_branch trains only")
-print("══════════════════════════════════════════════════════════════\n")
+# Build datasets
+tr_ds = PrecomputedDatasetMS(FEATS_DIR_MEL, FEATS_DIR_STAT, ALL_LABELS, _splits["train"], augment=True)
+vl_ds = PrecomputedDatasetMS(FEATS_DIR_MEL, FEATS_DIR_STAT, ALL_LABELS, _splits["val"],   augment=False)
+te_ds = PrecomputedDatasetMS(FEATS_DIR_MEL, FEATS_DIR_STAT, ALL_LABELS, _splits["test"],  augment=False)
 
-ablation_results = {}
+print("Fitting scaler...")
+sm, ss = fit_scaler(FEATS_DIR_STAT, _splits["train"])
 
-for cfg_abl in ABLATION_CONFIGS:
-    name     = cfg_abl["name"]
-    feat     = cfg_abl["features"]
-    stat_dim = len(feat)
-    print(f"── {name}  (stat_dim={stat_dim}) ──────────────────────────────")
+tr_ldr = DataLoader(tr_ds, batch_size=BATCH_SIZE, shuffle=True,  collate_fn=collate_ms,
+                    num_workers=NUM_WORKERS, pin_memory=True, persistent_workers=True, prefetch_factor=2)
+vl_ldr = DataLoader(vl_ds, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_ms,
+                    num_workers=NUM_WORKERS, pin_memory=True, persistent_workers=True, prefetch_factor=2)
+te_ldr = DataLoader(te_ds, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_ms,
+                    num_workers=NUM_WORKERS, pin_memory=True, persistent_workers=True, prefetch_factor=2)
 
-    tr_ds = PrecomputedDatasetMS(FEATS_DIR_MEL, FEATS_DIR_STAT, ALL_LABELS, _splits["train"], feat, augment=True)
-    vl_ds = PrecomputedDatasetMS(FEATS_DIR_MEL, FEATS_DIR_STAT, ALL_LABELS, _splits["val"],   feat, augment=False)
-    sm, ss = fit_scaler(tr_ds)
+model = MelStatCNN(num_classes=6, stat_dim=len(STAT_FEATURES)).to(DEVICE)
+p1    = torch.load(PHASE1_CKPT, map_location=DEVICE)
+model.mel_stream.load_state_dict(p1["model_state_dict"])
 
-    tr_ldr = DataLoader(tr_ds, batch_size=BATCH_SIZE, shuffle=True,  collate_fn=collate_ms,
-                        num_workers=NUM_WORKERS, pin_memory=True, persistent_workers=True, prefetch_factor=2)
-    vl_ldr = DataLoader(vl_ds, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_ms,
-                        num_workers=NUM_WORKERS, pin_memory=True, persistent_workers=True, prefetch_factor=2)
-
-    model = MelStatCNN(num_classes=6, stat_dim=stat_dim).to(DEVICE)
-    p1    = torch.load(PHASE1_CKPT, map_location=DEVICE)
-    model.mel_stream.load_state_dict(p1["model_state_dict"])
-    # Freeze CNN — only stat_branch + fc1 + fc2 train
-    for p in model.mel_stream.parameters(): p.requires_grad = False
-
-    opt  = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=5e-4, weight_decay=1e-4)
-    crit = nn.CrossEntropyLoss(weight=class_weights)
-    best_vl = 0.0
-    for epoch in range(1, ABLATION_EPOCHS+1):
-        tr_l,tr_a  = train_epoch_ms(model,tr_ldr,opt,crit,DEVICE,sm,ss)
-        vl_l,vl_a,_,_ = eval_epoch_ms(model,vl_ldr,crit,DEVICE,sm,ss)
-        if vl_a > best_vl: best_vl = vl_a
-        print(f"  Epoch {epoch:2d}/{ABLATION_EPOCHS}  train_acc={tr_a:.4f}  val_acc={vl_a:.4f}")
-    ablation_results[name] = {"val_acc":best_vl,"features":feat,"stat_dim":stat_dim}
-    print(f"  → Best val_acc: {best_vl:.4f}\n")
-
-# Print comparison table
-print("\n── Ablation Results ─────────────────────────────────────────────")
-print(f"{'Config':<35} {'stat_dim':>8} {'val_acc':>8}")
-print("-"*55)
-for k,v in ablation_results.items():
-    print(f"{k:<35} {v['stat_dim']:>8} {v['val_acc']:>8.4f}")
-
-best_name = max(ablation_results, key=lambda k: ablation_results[k]["val_acc"])
-best_feat = ablation_results[best_name]["features"]
-print(f"\nBest config: '{best_name}'  features={best_feat}")
-
-# ── FINAL FINE-TUNE (unfreeze all) ─────────────────────────────────────────────
-print(f"\n── Final fine-tune (unfreeze all, {FINETUNE_EPOCHS} epochs) ────────────────────")
-stat_dim_f = len(best_feat)
-
-tr_ds_f = PrecomputedDatasetMS(FEATS_DIR_MEL, FEATS_DIR_STAT, ALL_LABELS, _splits["train"], best_feat, augment=True)
-vl_ds_f = PrecomputedDatasetMS(FEATS_DIR_MEL, FEATS_DIR_STAT, ALL_LABELS, _splits["val"],   best_feat, augment=False)
-te_ds_f = PrecomputedDatasetMS(FEATS_DIR_MEL, FEATS_DIR_STAT, ALL_LABELS, _splits["test"],  best_feat, augment=False)
-sm_f, ss_f = fit_scaler(tr_ds_f)
-
-# Save scaler
-scaler_path = os.path.join(MODELS_DIR, "stat_scaler_2b.pkl")
-pickle.dump({"mean":sm_f,"std":ss_f,"features":best_feat}, open(scaler_path,"wb"))
-print(f"Scaler saved → {scaler_path} ✓")
-
-tr_ldr_f = DataLoader(tr_ds_f, batch_size=BATCH_SIZE, shuffle=True,  collate_fn=collate_ms,
-                      num_workers=NUM_WORKERS, pin_memory=True, persistent_workers=True, prefetch_factor=2)
-vl_ldr_f = DataLoader(vl_ds_f, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_ms,
-                      num_workers=NUM_WORKERS, pin_memory=True, persistent_workers=True, prefetch_factor=2)
-te_ldr_f = DataLoader(te_ds_f, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_ms,
-                      num_workers=NUM_WORKERS, pin_memory=True, persistent_workers=True, prefetch_factor=2)
-
-model_f = MelStatCNN(num_classes=6, stat_dim=stat_dim_f).to(DEVICE)
-p1 = torch.load(PHASE1_CKPT, map_location=DEVICE)
-model_f.mel_stream.load_state_dict(p1["model_state_dict"])
-for p in model_f.parameters(): p.requires_grad = True
-
-# Differential LRs: mel_stream already trained → keep low to protect learned features
-optimizer_f = torch.optim.AdamW([
-    {"params": model_f.mel_stream.parameters(),  "lr": 1e-4},   # protect Phase 1 knowledge
-    {"params": model_f.stat_branch.parameters(), "lr": 5e-4},   # new branch: learn fast
-    {"params": model_f.fc1.parameters(),         "lr": 5e-4},
-    {"params": model_f.fc2.parameters(),         "lr": 5e-4},
+# mel_stream came from Phase 1 — low LR to keep what it already learned
+optimizer = torch.optim.AdamW([
+    {"params": model.mel_stream.parameters(),  "lr": 1e-4},
+    {"params": model.stat_branch.parameters(), "lr": 5e-4},
+    {"params": model.fc1.parameters(),         "lr": 5e-4},
+    {"params": model.fc2.parameters(),         "lr": 5e-4},
 ], weight_decay=1e-4)
-crit_f   = nn.CrossEntropyLoss(weight=class_weights)
-sched_f  = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_f, T_max=FINETUNE_EPOCHS)
+criterion = nn.CrossEntropyLoss(weight=class_weights)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=TRAIN_EPOCHS)
 
-best_vl_f = 0.0; ckpt_path = os.path.join(MODELS_DIR, "phase2b_best.pth")
+print(f"\nTraining {TRAIN_EPOCHS} epochs — features: {STAT_FEATURES}\n")
 
-for epoch in range(1, FINETUNE_EPOCHS+1):
-    tr_l,tr_a      = train_epoch_ms(model_f,tr_ldr_f,optimizer_f,crit_f,DEVICE,sm_f,ss_f)
-    vl_l,vl_a,_,_  = eval_epoch_ms( model_f,vl_ldr_f,crit_f,DEVICE,sm_f,ss_f)
-    sched_f.step()
-    print(f"Epoch {epoch:3d}/{FINETUNE_EPOCHS}  train_acc={tr_a:.4f}  val_acc={vl_a:.4f}",end="")
-    if vl_a > best_vl_f:
-        best_vl_f = vl_a
-        save_ckpt(model_f, epoch, vl_a, ckpt_path, best_feat, stat_dim_f); print("  ← saved",end="")
-    print()
+best_val  = 0.0
+ckpt_path = os.path.join(MODELS_DIR, "phase2b_best.pth")
 
-print(f"\nBest val accuracy: {best_vl_f:.4f}")
+for epoch in range(1, TRAIN_EPOCHS + 1):
+    tr_l, tr_a     = train_epoch_ms(model, tr_ldr, optimizer, criterion, DEVICE, sm, ss)
+    vl_l, vl_a,_,_ = eval_epoch_ms( model, vl_ldr, criterion, DEVICE, sm, ss)
+    scheduler.step()
+    saved = ""
+    if vl_a > best_val:
+        best_val = vl_a
+        save_ckpt(model, epoch, vl_a, ckpt_path, STAT_FEATURES, len(STAT_FEATURES))
+        saved = "  ← saved"
+    print(f"Epoch {epoch:3d}/{TRAIN_EPOCHS}  train={tr_a:.4f}  val={vl_a:.4f}{saved}")
+
+print(f"\nBest val accuracy: {best_val:.4f}")
 
 # ── TEST EVALUATION ────────────────────────────────────────────────────────────
 # ┌──────────────────────────────────────────────────────────────────────────────┐
@@ -500,18 +438,24 @@ print(f"\nBest val accuracy: {best_vl_f:.4f}")
 # │  → Download both, upload as a single dataset for Phase 3 if desired.         │
 # └──────────────────────────────────────────────────────────────────────────────┘
 ckpt = torch.load(ckpt_path, map_location=DEVICE)
-model_f.load_state_dict(ckpt["model_state_dict"])
+model.load_state_dict(ckpt["model_state_dict"])
+
+# Save scaler so inference scripts don't need to refit it
+scaler_path = os.path.join(MODELS_DIR, "stat_scaler_2b.pkl")
+with open(scaler_path, "wb") as f:
+    pickle.dump({"mean": sm, "std": ss, "features": STAT_FEATURES}, f)
+print(f"Scaler saved → {scaler_path}")
 
 t0 = time.time()
-_, ta, preds, labels = eval_epoch_ms(model_f, te_ldr_f, crit_f, DEVICE, sm_f, ss_f)
+_, ta, preds, labels = eval_epoch_ms(model, te_ldr, criterion, DEVICE, sm, ss)
 t_test = time.time() - t0
-n_test = len(te_ds_f)
+n_test = len(te_ds)
 ms_per_sample = (t_test / n_test) * 1000
 
 print(f"\n── Test Results ──────────────────────────────────────────")
 print(f"Test accuracy : {ta:.4f}")
 print(f"Macro F1      : {f1_score(labels,preds,average='macro'):.4f}")
-print(f"Stat features : {best_feat}")
+print(f"Stat features : {STAT_FEATURES}")
 print("\n",classification_report(labels,preds,target_names=CLASS_NAMES))
 
 print(f"\n── Inference Timing ──────────────────────────────────────")
@@ -536,7 +480,7 @@ print(f"\nFiles saved: phase2b_best.pth, stat_scaler_2b.pkl  → /kaggle/working
 # Download feats_stat_archive.zip and add it to your features dataset alongside
 # feats_mel/ and feats_mfcc/ from Phases 1 & 2.
 import shutil
-for folder, archive in [("feats_mel","feats_mel_archive"), ("feats_stat","feats_stat_archive")]:
+for folder, archive in [("feats_mel","feats_mel_archive"), ("feats_stat_v2","feats_stat_v2_archive")]:
     src = pathlib.Path("/kaggle/working") / folder
     if src.exists() and any(src.glob("*.npy")):   # only archive if freshly computed this session
         shutil.make_archive(f"/kaggle/working/{archive}", "zip", "/kaggle/working", folder)
