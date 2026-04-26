@@ -43,7 +43,7 @@ from scipy.signal import resample_poly
 
 # ── PATHS ─────────────────────────────────────────────────────────────────────
 ROOT_DIR    = "/kaggle/input/datasets/mostafaehab41/machine-fault-dataset"
-PHASE1_CKPT = "/kaggle/input/phase1ckpt/phase1_best.pth"   # ← CHANGE if your dataset name differs
+PHASE1_CKPT = "/kaggle//input/datasets/manarabdelshafy/phase1-best-pth/phase1_best.pth"   # ← CHANGE if your dataset name differs
 MODELS_DIR  = "/kaggle/working"
 
 # ── FEATURE CACHE — AUTO-DETECT ──────────────────────────────────────────────
@@ -67,6 +67,16 @@ def _feat_dir(name: str) -> pathlib.Path:
 
 FEATS_DIR_MEL  = _feat_dir("feats_mel")      # reuse Phase 1 cache if available
 FEATS_DIR_STAT = _feat_dir("feats_stat_v2")  # 5-element: rms, zcr, rolloff, bandwidth, kurtosis
+
+def copy_if_input(src, dst):
+    if str(src).startswith("/kaggle/input"):
+        print(f"Copying {src} → {dst}")
+        shutil.copytree(src, dst, dirs_exist_ok=True)
+        return pathlib.Path(dst)
+    return src
+
+FEATS_DIR_MEL  = copy_if_input(FEATS_DIR_MEL, "/kaggle/working/feats_mel")
+FEATS_DIR_STAT = copy_if_input(FEATS_DIR_STAT, "/kaggle/working/feats_stat_v2")
 
 print(f"ROOT_DIR    : {ROOT_DIR}")
 print(f"PHASE1_CKPT : {PHASE1_CKPT}")
