@@ -43,7 +43,7 @@ from scipy.signal import resample_poly
 
 # ── PATHS ─────────────────────────────────────────────────────────────────────
 ROOT_DIR    = "/kaggle/input/datasets/mostafaehab41/machine-fault-dataset"
-PHASE1_CKPT = "/kaggle//input/datasets/manarabdelshafy/phase1-best-pth/phase1_best.pth"   # ← CHANGE if your dataset name differs
+PHASE1_CKPT = "/kaggle/input/datasets/manarabdelshafy/phase1-best-pth/phase1_best.pth"   # ← CHANGE if your dataset name differs
 MODELS_DIR  = "/kaggle/working"
 
 # ── FEATURE CACHE — AUTO-DETECT ──────────────────────────────────────────────
