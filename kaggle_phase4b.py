@@ -77,7 +77,8 @@ DEVICE     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SR         = 16000
 DURATION   = 2.75
 BATCH_SIZE = 32
-WORKERS    = 4
+WORKERS    = 2   # 2 is enough for .npy loads; 4 workers on Kaggle's 4-CPU box
+                 # compete with the main process and cause persistent_workers deadlocks
 
 print("Device:", DEVICE)
 
@@ -514,11 +515,11 @@ print("Fitting stat scaler...")
 s_mean, s_std = fit_scaler(FEATS_STAT_V2, _splits["train"], stat_cols)
 
 tr_ldr = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,  collate_fn=collate3,
-                    num_workers=WORKERS, pin_memory=True, persistent_workers=True, prefetch_factor=2)
+                    num_workers=WORKERS, pin_memory=True, persistent_workers=False, prefetch_factor=2)
 vl_ldr = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate3,
-                    num_workers=WORKERS, pin_memory=True, persistent_workers=True, prefetch_factor=2)
+                    num_workers=WORKERS, pin_memory=True, persistent_workers=False, prefetch_factor=2)
 te_ldr = DataLoader(test_ds,  batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate3,
-                    num_workers=WORKERS, pin_memory=True, persistent_workers=True, prefetch_factor=2)
+                    num_workers=WORKERS, pin_memory=True, persistent_workers=False, prefetch_factor=2)
 
 model = MelMFCCStatCNN(num_classes=6, stat_dim=len(STAT_FEATURES)).to(DEVICE)
 load_phase3_weights(model, PHASE3_CKPT, DEVICE)

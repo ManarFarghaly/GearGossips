@@ -54,7 +54,7 @@ FEATS_STAT_V2 = os.path.normpath(os.path.join(MODELS_DIR, "..", "features", "sta
 DEVICE       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BATCH_SIZE   = 32
 TRAIN_EPOCHS = 25   # single run, differential LRs handle the new branch warmup
-NUM_WORKERS  = 4
+NUM_WORKERS  = 2   # 2 is enough for .npy loads; more workers cause lock contention on 4-CPU machines
 
 # Fixed feature set — no ablation, we already know what works from Phase 3
 STAT_FEATURES = ["rms", "zcr", "rolloff", "bandwidth", "kurtosis"]
@@ -255,11 +255,11 @@ print("Fitting scaler...")
 s_mean, s_std = fit_scaler(FEATS_STAT_V2, _splits["train"], stat_cols)
 
 tr_ldr = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,  collate_fn=collate3,
-                    num_workers=NUM_WORKERS, pin_memory=True, persistent_workers=True, prefetch_factor=2)
+                    num_workers=NUM_WORKERS, pin_memory=True, persistent_workers=False, prefetch_factor=2)
 vl_ldr = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate3,
-                    num_workers=NUM_WORKERS, pin_memory=True, persistent_workers=True, prefetch_factor=2)
+                    num_workers=NUM_WORKERS, pin_memory=True, persistent_workers=False, prefetch_factor=2)
 te_ldr = DataLoader(test_ds,  batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate3,
-                    num_workers=NUM_WORKERS, pin_memory=True, persistent_workers=True, prefetch_factor=2)
+                    num_workers=NUM_WORKERS, pin_memory=True, persistent_workers=False, prefetch_factor=2)
 
 # ---------- model + optimizer ----------------------------------------------------
 

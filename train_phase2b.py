@@ -52,7 +52,7 @@ os.makedirs(FEATS_DIR_STAT, exist_ok=True)
 DEVICE      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BATCH_SIZE  = 32
 TRAIN_EPOCHS = 25   # single run — differential LRs warm up stat branch naturally
-NUM_WORKERS  = 4
+NUM_WORKERS  = 2   # 2 is enough for .npy loads; more workers cause lock contention on 4-CPU machines
 
 # Fixed stat features — no ablation needed
 STAT_FEATURES = ALL_FEATURE_NAMES_V2   # ["rms", "zcr", "rolloff", "bandwidth", "kurtosis"]
@@ -244,11 +244,11 @@ print("Fitting scaler from training split .npy files ...")
 sm, ss = fit_scaler(FEATS_DIR_STAT, _splits["train"])
 
 tr_ldr = DataLoader(tr_ds, batch_size=BATCH_SIZE, shuffle=True,  collate_fn=collate_mel_stat,
-                    num_workers=NUM_WORKERS, pin_memory=True, persistent_workers=True, prefetch_factor=2)
+                    num_workers=NUM_WORKERS, pin_memory=True, persistent_workers=False, prefetch_factor=2)
 vl_ldr = DataLoader(vl_ds, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_mel_stat,
-                    num_workers=NUM_WORKERS, pin_memory=True, persistent_workers=True, prefetch_factor=2)
+                    num_workers=NUM_WORKERS, pin_memory=True, persistent_workers=False, prefetch_factor=2)
 te_ldr = DataLoader(te_ds, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_mel_stat,
-                    num_workers=NUM_WORKERS, pin_memory=True, persistent_workers=True, prefetch_factor=2)
+                    num_workers=NUM_WORKERS, pin_memory=True, persistent_workers=False, prefetch_factor=2)
 
 model = MelStatCNN(num_classes=6, stat_dim=len(STAT_FEATURES)).to(DEVICE)
 
