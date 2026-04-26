@@ -47,7 +47,7 @@ ROOT_DIR    = _find_machine_root(_DATASET_BASE)
 # Phase 1 checkpoint — download phase1_best.pth from Phase 1's output, upload
 # it as a Kaggle dataset, add it to this notebook, then set the path below.
 # Example path after uploading a dataset named "phase1ckpt":
-PHASE1_CKPT = "/kaggle/input/phase1ckpt/phase1_best.pth"   # ← CHANGE if your dataset name differs
+PHASE1_CKPT = "/kaggle/input/datasets/manarabdelshafy/phase1-best-pth/phase1_best.pth"  
 MODELS_DIR  = "/kaggle/working"
 
 print(f"ROOT_DIR    : {ROOT_DIR}")
