@@ -39,7 +39,32 @@ EPOCHS       = 20      # val_acc was 97.26% after epoch 1 — 20 is plenty, 50 w
 LR           = 1e-3
 WEIGHT_DECAY = 1e-4
 NUM_WORKERS  = 4       # Kaggle T4×2 has exactly 4 vCPUs — more than 4 causes context-switch overhead
-FEATS_DIR    = pathlib.Path("/kaggle/working/feats_mel")  # pre-computed mel-specs live here
+
+# ── FEATURE CACHE — AUTO-DETECT ──────────────────────────────────────────────
+# Upload your pre-computed features as ANY Kaggle dataset under your account
+# (manarabdelshafy). The script searches all your datasets automatically —
+# no path variable to set. If the dataset is not attached, features are
+# computed fresh (~15 min) and archived at the end for future reuse.
+
+def _feat_dir(name: str) -> pathlib.Path:
+    """
+    Auto-detect pre-computed feature folder from any dataset by manarabdelshafy.
+    Searches /kaggle/input/datasets/manarabdelshafy/<any-name>/<name>/*.npy.
+    Falls back to /kaggle/working/<name> (freshly computed) if nothing found.
+    """
+    owner = pathlib.Path("/kaggle/input/datasets/manarabdelshafy")
+    if owner.exists():
+        for ds in sorted(owner.iterdir()):
+            if not ds.is_dir(): continue
+            candidate = ds / name
+            if candidate.exists() and any(candidate.glob("*.npy")):
+                print(f"[cache] '{name}' found at {candidate}  ✓  (skipping recomputation)")
+                return candidate
+    working = pathlib.Path("/kaggle/working") / name
+    print(f"[cache] '{name}' not in uploaded datasets → will compute to {working}")
+    return working
+
+FEATS_DIR = _feat_dir("feats_mel")
 
 CLASS_NAMES = [
     "Machine1_Normal", "Machine1_Abnormal",
@@ -241,9 +266,14 @@ def precompute_all_mel(paths, feats_dir, preprocessor, n_workers=4):
     Pre-compute mel-spectrograms for all wav files.
     Skips files already saved (safe to interrupt and resume).
     Uses multiprocessing so 4 CPU cores run in parallel (~15 min for 56k files).
+    If feats_dir is under /kaggle/input (read-only uploaded dataset), skips entirely.
     """
     import multiprocessing, tqdm as tqdm_module
     feats_dir = pathlib.Path(feats_dir)
+    # Read-only input dataset — all files already there, nothing to compute
+    if str(feats_dir).startswith("/kaggle/input"):
+        print(f"[cache] mel features loaded from uploaded dataset {feats_dir}  ✓")
+        return
     feats_dir.mkdir(parents=True, exist_ok=True)
 
     already = sum(1 for i in range(len(paths)) if (feats_dir/f"{i:06d}.npy").exists())
@@ -564,4 +594,30 @@ plt.suptitle("Phase 1 — Mel-Spectrogram CNN")
 plt.tight_layout(); plt.show()
 
 print(f"\nModel saved to: {ckpt_path}")
-print("Download phase1_best.pth and upload it as a Kaggle dataset for Phase 2.")
+
+# ── ARCHIVE FEATURES FOR REUSE IN LATER PHASES ───────────────────────────────
+# Zipping feats_mel now saves ~15 min of recomputation in EVERY future notebook.
+# Steps to reuse:
+#   1. Download feats_mel_archive.zip from the Kaggle Output tab (right panel)
+#   2. Create a NEW Kaggle Dataset → upload the .zip → name it e.g. "machine-features"
+#   3. In Phase 2 / 2b / 3 / any future notebook:
+#        Add Datasets → search "machine-features" → click Add
+#        Set: FEATS_INPUT_DIR = "/kaggle/input/machine-features"
+#   4. That's it — precomputation is skipped automatically.
+#
+# Note: as you add more feature types (mfcc, stat) in later phases, download
+#       their feats_* folders too and re-upload the dataset with all folders inside.
+if str(FEATS_DIR).startswith("/kaggle/working"):
+    # Features were freshly computed this session → zip for upload
+    import shutil
+    print("\nArchiving mel features for reuse in later phases ...")
+    shutil.make_archive("/kaggle/working/feats_mel_archive", "zip",
+                        "/kaggle/working", "feats_mel")
+    sz = os.path.getsize("/kaggle/working/feats_mel_archive.zip") / 1e9
+    print(f"feats_mel_archive.zip  ({sz:.2f} GB)  saved to /kaggle/working/")
+    print("→ Create a Kaggle dataset named anything, upload the .zip inside it.")
+    print("  Next run: attach that dataset — script will find feats_mel/ automatically.")
+else:
+    print("Features were loaded from an uploaded dataset — nothing to archive.")
+
+print("\nDownload phase1_best.pth and upload it as a Kaggle dataset for Phase 2.")

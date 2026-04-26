@@ -47,7 +47,7 @@ def _find_machine_root(base: str) -> str:
 ROOT_DIR    = _find_machine_root(_DATASET_BASE)
 # Download phase2_best.pth from Phase 2's output, upload as a Kaggle dataset,
 # add it to this notebook, then update the path below if needed.
-PHASE2_CKPT = "/kaggle/input/phase2ckpt/phase2_best.pth"   # ← CHANGE if your dataset name differs
+PHASE2_CKPT = "/kaggle/input/datasets/manarabdelshafy/phase2ckpt/phase2_best.pth"   # ← CHANGE if your dataset name differs
 MODELS_DIR  = "/kaggle/working"
 
 print(f"ROOT_DIR    : {ROOT_DIR}")
@@ -59,8 +59,30 @@ print("Device:", DEVICE)
 
 SR=16000; DURATION_SEC=2.75; BATCH_SIZE=32
 NUM_WORKERS      = 4
-FEATS_DIR_MEL    = pathlib.Path("/kaggle/working/feats_mel")
-FEATS_DIR_MFCC   = pathlib.Path("/kaggle/working/feats_mfcc")
+
+# ── FEATURE CACHE — AUTO-DETECT ──────────────────────────────────────────────
+# Upload your features dataset under your account (manarabdelshafy), any name.
+# The script finds feats_mel/ and feats_mfcc/ automatically — no config needed.
+# If not found, features are computed fresh (~53 min) and archived at the end.
+
+def _feat_dir(name: str) -> pathlib.Path:
+    """Auto-detect feature folder from any dataset by manarabdelshafy.
+    Falls back to /kaggle/working/<name> if not found."""
+    owner = pathlib.Path("/kaggle/input/datasets/manarabdelshafy")
+    if owner.exists():
+        for ds in sorted(owner.iterdir()):
+            if not ds.is_dir(): continue
+            candidate = ds / name
+            if candidate.exists() and any(candidate.glob("*.npy")):
+                print(f"[cache] '{name}' found at {candidate}  ✓  (skipping recomputation)")
+                return candidate
+    working = pathlib.Path("/kaggle/working") / name
+    print(f"[cache] '{name}' not in uploaded datasets → will compute to {working}")
+    return working
+
+FEATS_DIR_MEL  = _feat_dir("feats_mel")
+FEATS_DIR_MFCC = _feat_dir("feats_mfcc")
+FEATS_DIR_STAT = _feat_dir("feats_stat")   # 5-element stat vector per file
 ABLATION_EPOCHS  = 10    # fast — CNN is frozen, only FC branches train
 FINETUNE_EPOCHS  = 20    # full end-to-end fine-tune after ablation
 CLASS_NAMES=["Machine1_Normal","Machine1_Abnormal","Machine2_Normal",
@@ -176,36 +198,50 @@ def spec_augment(mel, freq_mask=30, time_mask=15, n_freq=2, n_time=2):
         mel[:, :, t0:t0+t] = 0.0
     return mel
 
-def _precompute_one_dual(args):
-    """Top-level worker for multiprocessing: preprocess one wav and save mel + mfcc as .npy."""
-    idx, wav_path, mel_dir, mfcc_dir, preprocessor = args
+def _precompute_one_triple(args):
+    """Worker: save mel (1,128,84) + mfcc (3,40,84) + all-5 stat (5,) for one wav."""
+    idx, wav_path, mel_dir, mfcc_dir, stat_dir, preprocessor = args
     mel_out  = pathlib.Path(mel_dir)  / f"{idx:06d}.npy"
     mfcc_out = pathlib.Path(mfcc_dir) / f"{idx:06d}.npy"
-    if mel_out.exists() and mfcc_out.exists():
+    stat_out = pathlib.Path(stat_dir) / f"{idx:06d}.npy"
+    if mel_out.exists() and mfcc_out.exists() and stat_out.exists():
         return
     try:
         w = preprocessor.preprocess(str(wav_path), mode="inference")
-        np.save(mel_out,  compute_mel_spectrogram(w))
-        np.save(mfcc_out, compute_mfcc(w))
+        if not mel_out.exists():  np.save(mel_out,  compute_mel_spectrogram(w))
+        if not mfcc_out.exists(): np.save(mfcc_out, compute_mfcc(w))
+        if not stat_out.exists(): np.save(stat_out, compute_statistical_features(w))
     except Exception:
-        np.save(mel_out,  np.zeros((1, 128, 84), dtype=np.float32))
-        np.save(mfcc_out, np.zeros((3, 40,  84), dtype=np.float32))
+        if not mel_out.exists():  np.save(mel_out,  np.zeros((1,128,84), dtype=np.float32))
+        if not mfcc_out.exists(): np.save(mfcc_out, np.zeros((3,40,84),  dtype=np.float32))
+        if not stat_out.exists(): np.save(stat_out, np.zeros(5,           dtype=np.float32))
 
-def precompute_all_dual(paths, mel_dir, mfcc_dir, preprocessor, n_workers=4):
-    """Pre-compute mel + mfcc for every wav file. Skips already-saved files (resumable)."""
+def precompute_all_triple(paths, mel_dir, mfcc_dir, stat_dir, preprocessor, n_workers=4):
+    """Pre-compute mel + mfcc + stat for every wav. Skips cached files (resumable).
+    If all three dirs are under /kaggle/input (uploaded dataset), skips entirely."""
     import multiprocessing, tqdm as tqdm_module
-    mel_dir  = pathlib.Path(mel_dir);  mel_dir.mkdir(parents=True, exist_ok=True)
-    mfcc_dir = pathlib.Path(mfcc_dir); mfcc_dir.mkdir(parents=True, exist_ok=True)
+    mel_dir  = pathlib.Path(mel_dir)
+    mfcc_dir = pathlib.Path(mfcc_dir)
+    stat_dir = pathlib.Path(stat_dir)
+    all_input = all(str(d).startswith("/kaggle/input") for d in [mel_dir, mfcc_dir, stat_dir])
+    if all_input:
+        print("[cache] mel+mfcc+stat loaded from uploaded dataset  ✓"); return
+    for d in [mel_dir, mfcc_dir, stat_dir]:
+        if not str(d).startswith("/kaggle/input"):
+            d.mkdir(parents=True, exist_ok=True)
     already = sum(1 for i in range(len(paths))
-                  if (mel_dir/f"{i:06d}.npy").exists() and (mfcc_dir/f"{i:06d}.npy").exists())
+                  if (mel_dir/f"{i:06d}.npy").exists()
+                  and (mfcc_dir/f"{i:06d}.npy").exists()
+                  and (stat_dir/f"{i:06d}.npy").exists())
     if already == len(paths):
-        print(f"All {len(paths)} mel+mfcc features already cached  (skipping)"); return
-    print(f"Pre-computing mel + mfcc for {len(paths)} files using {n_workers} workers ...")
-    print("Runs ONCE per session (~20 min). Training epochs will then take ~3-5 min each.")
-    args = [(i, p, str(mel_dir), str(mfcc_dir), preprocessor) for i, p in enumerate(paths)]
+        print(f"All {len(paths)} mel+mfcc+stat features already cached  (skipping)"); return
+    print(f"Pre-computing mel + mfcc + stat for {len(paths)} files using {n_workers} workers ...")
+    print("Runs ONCE (~22 min). Epochs will then take ~3-5 min — NO wav reads during training.")
+    args = [(i, p, str(mel_dir), str(mfcc_dir), str(stat_dir), preprocessor)
+            for i, p in enumerate(paths)]
     with multiprocessing.Pool(n_workers) as pool:
-        list(tqdm_module.tqdm(pool.imap(_precompute_one_dual, args, chunksize=64),
-                              total=len(paths), desc="mel+mfcc"))
+        list(tqdm_module.tqdm(pool.imap(_precompute_one_triple, args, chunksize=64),
+                              total=len(paths), desc="mel+mfcc+stat"))
     print("Pre-computation done.")
 
 # ── DATASET (returns mel, mfcc, stat as a 3-tuple) ───────────────────────────
@@ -264,39 +300,33 @@ def collate3(batch):
             torch.stack([f[2] for f in feats])), torch.stack(labels)
 
 class PrecomputedDataset3(Dataset):
-    """Loads pre-computed mel + mfcc .npy files; computes stat features on-the-fly (fast numpy).
-    SpecAugment applied to mel at train time."""
-    def __init__(self, mel_dir, mfcc_dir, labels, indices, stat_features, augment=False):
+    """Loads pre-computed mel + mfcc + stat .npy files from disk.
+    stat_dir must contain all-5-feature vectors saved by _precompute_one_triple.
+    stat_cols is a list of column indices to slice (e.g. [0] for rms_only, [0,1,2,3,4] for all_five).
+    SpecAugment applied to mel tensor at train time — zero librosa cost."""
+    # Maps feature name → column index in the all-5 stat vector
+    STAT_COL = {"rms": 0, "zcr": 1, "centroid": 2, "rolloff": 3, "bandwidth": 4}
+
+    def __init__(self, mel_dir, mfcc_dir, stat_dir, labels, indices, stat_features, augment=False):
         self.mel_dir       = pathlib.Path(mel_dir)
         self.mfcc_dir      = pathlib.Path(mfcc_dir)
+        self.stat_dir      = pathlib.Path(stat_dir)
         self.labels        = labels
         self.indices       = indices
-        self.stat_features = stat_features
+        self.stat_cols     = [self.STAT_COL[f] for f in stat_features]
         self.augment       = augment
-        # Pre-load all wav paths from the full dataset scan so we can compute stat features
-        # We need the wav paths — they are stored as ALL_PATHS at module level after scanning
-        self._all_paths    = None  # set externally: ds.set_paths(ALL_PATHS)
-    def set_paths(self, all_paths):
-        self._all_paths = all_paths
+
     def __len__(self): return len(self.indices)
+
     def __getitem__(self, idx):
         ri   = self.indices[idx]
         mel  = torch.tensor(np.load(self.mel_dir  / f"{ri:06d}.npy"), dtype=torch.float32)
         mfcc = torch.tensor(np.load(self.mfcc_dir / f"{ri:06d}.npy"), dtype=torch.float32)
         if self.augment:
             mel = spec_augment(mel)
-        # Compute stat features inline — stat is fast pure-numpy (< 0.005s each).
-        # We read the raw wav directly (no augmentation, no resampling needed for stat).
-        if self._all_paths is not None:
-            import soundfile as _sf
-            try:
-                w, _sr = _sf.read(str(self._all_paths[ri]), always_2d=False, dtype="float32")
-                if w.ndim > 1: w = w.mean(axis=1)
-            except Exception:
-                w = np.zeros(int(SR * DURATION_SEC), dtype=np.float32)
-        else:
-            w = np.zeros(int(SR * DURATION_SEC), dtype=np.float32)
-        stat = compute_statistical_features(w, feature_names=self.stat_features)
+        # Load all-5 stat vector and slice the requested columns — pure numpy, no wav read
+        stat_all = np.load(self.stat_dir / f"{ri:06d}.npy")   # shape (5,)
+        stat     = stat_all[self.stat_cols].astype(np.float32) # shape (stat_dim,)
         return (mel, mfcc, torch.tensor(stat, dtype=torch.float32)), torch.tensor(self.labels[ri], dtype=torch.long)
 
 # ── MODELS ────────────────────────────────────────────────────────────────────
@@ -374,14 +404,16 @@ def load_phase2_weights(model, ckpt_path, device):
         {k[len("mfcc_stream."):]:v for k,v in sd.items() if k.startswith("mfcc_stream.")})
     print("Loaded Phase 2 CNN weights \u2713")
 
-def fit_scaler_precomputed(dataset):
-    """Compute mean & std from a PrecomputedDataset3 (stat features only)."""
-    all_stat=[]
-    for i in range(len(dataset)):
-        (_,_,stat_t),_=dataset[i]
-        all_stat.append(stat_t.numpy())
-    arr=np.stack(all_stat,axis=0)
-    return arr.mean(0), arr.std(0)+1e-8
+def fit_scaler_precomputed(stat_dir, indices, stat_cols):
+    """Compute mean & std by loading stat .npy files directly — no wav reads, no dataset iteration.
+    stat_dir : path to feats_stat/  (each file is a (5,) float32 array)
+    indices  : list of global file indices in the training split
+    stat_cols: list of column indices to slice (matching the model's stat_dim)
+    Returns (mean, std) each of shape (stat_dim,)."""
+    stat_dir = pathlib.Path(stat_dir)
+    all_stat = [np.load(stat_dir / f"{i:06d}.npy")[stat_cols] for i in indices]
+    arr = np.stack(all_stat, axis=0)   # (N, stat_dim)
+    return arr.mean(0), arr.std(0) + 1e-8
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 # Step A: scan all files + create/load the stratified split
@@ -396,7 +428,7 @@ _infer_prep = AudioPreprocessor(PreprocessConfig(
     target_sr=SR, default_duration_sec=DURATION_SEC, trim_silence=True, normalize_mode="peak",
     augmentation=AugmentationConfig(enabled=False),
 ))
-precompute_all_dual(ALL_PATHS, FEATS_DIR_MEL, FEATS_DIR_MFCC, _infer_prep, n_workers=NUM_WORKERS)
+precompute_all_triple(ALL_PATHS, FEATS_DIR_MEL, FEATS_DIR_MFCC, FEATS_DIR_STAT, _infer_prep, n_workers=NUM_WORKERS)
 
 # Step C: load split indices
 _splits = json.load(open(pathlib.Path(MODELS_DIR) / "split_indices.json"))
@@ -411,14 +443,15 @@ for cfg_ablation in ABLATION_CONFIGS:
     print(f"Ablation: {name}  (stat_dim={stat_dim})")
     print(f"{'='*60}")
 
-    train_ds = PrecomputedDataset3(FEATS_DIR_MEL, FEATS_DIR_MFCC, ALL_LABELS, _splits["train"], feat, augment=True)
-    val_ds   = PrecomputedDataset3(FEATS_DIR_MEL, FEATS_DIR_MFCC, ALL_LABELS, _splits["val"],   feat, augment=False)
-    train_ds.set_paths(ALL_PATHS)
-    val_ds.set_paths(ALL_PATHS)
+    stat_cols = [PrecomputedDataset3.STAT_COL[f] for f in feat]
+    train_ds = PrecomputedDataset3(FEATS_DIR_MEL, FEATS_DIR_MFCC, FEATS_DIR_STAT,
+                                   ALL_LABELS, _splits["train"], feat, augment=True)
+    val_ds   = PrecomputedDataset3(FEATS_DIR_MEL, FEATS_DIR_MFCC, FEATS_DIR_STAT,
+                                   ALL_LABELS, _splits["val"],   feat, augment=False)
 
-    # Fit StandardScaler on training stat features
-    print("Fitting scaler on training stat features...")
-    scaler_mean, scaler_std = fit_scaler_precomputed(train_ds)
+    # Fit StandardScaler from .npy files directly — instant, no wav reads
+    print("Fitting scaler on training stat features (from .npy cache)...")
+    scaler_mean, scaler_std = fit_scaler_precomputed(FEATS_DIR_STAT, _splits["train"], stat_cols)
 
     tr_loader=DataLoader(train_ds,batch_size=BATCH_SIZE,shuffle=True, collate_fn=collate3,
                          num_workers=NUM_WORKERS,pin_memory=True,persistent_workers=True,prefetch_factor=2)
@@ -461,14 +494,15 @@ print(f"\nBest config: '{best_name}' with features {best_feat}")
 print(f"\n\u2500\u2500 Final fine-tune (unfreeze all, {FINETUNE_EPOCHS} epochs) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500")
 stat_dim_final=len(best_feat)
 
-train_ds_f = PrecomputedDataset3(FEATS_DIR_MEL, FEATS_DIR_MFCC, ALL_LABELS, _splits["train"], best_feat, augment=True)
-val_ds_f   = PrecomputedDataset3(FEATS_DIR_MEL, FEATS_DIR_MFCC, ALL_LABELS, _splits["val"],   best_feat, augment=False)
-test_ds_f  = PrecomputedDataset3(FEATS_DIR_MEL, FEATS_DIR_MFCC, ALL_LABELS, _splits["test"],  best_feat, augment=False)
-train_ds_f.set_paths(ALL_PATHS)
-val_ds_f.set_paths(ALL_PATHS)
-test_ds_f.set_paths(ALL_PATHS)
+stat_cols_f = [PrecomputedDataset3.STAT_COL[f] for f in best_feat]
+train_ds_f = PrecomputedDataset3(FEATS_DIR_MEL, FEATS_DIR_MFCC, FEATS_DIR_STAT,
+                                  ALL_LABELS, _splits["train"], best_feat, augment=True)
+val_ds_f   = PrecomputedDataset3(FEATS_DIR_MEL, FEATS_DIR_MFCC, FEATS_DIR_STAT,
+                                  ALL_LABELS, _splits["val"],   best_feat, augment=False)
+test_ds_f  = PrecomputedDataset3(FEATS_DIR_MEL, FEATS_DIR_MFCC, FEATS_DIR_STAT,
+                                  ALL_LABELS, _splits["test"],  best_feat, augment=False)
 
-scaler_mean_f,scaler_std_f=fit_scaler_precomputed(train_ds_f)
+scaler_mean_f, scaler_std_f = fit_scaler_precomputed(FEATS_DIR_STAT, _splits["train"], stat_cols_f)
 # Save scaler so infer.py can use it
 pickle.dump({"mean":scaler_mean_f,"std":scaler_std_f,"features":best_feat},
             open(os.path.join(MODELS_DIR,"stat_scaler.pkl"),"wb"))
@@ -543,3 +577,17 @@ cm=confusion_matrix(labels,preds)
 plt.figure(figsize=(8,6)); sns.heatmap(cm,annot=True,fmt="d",cmap="Purples",xticklabels=CLASS_NAMES,yticklabels=CLASS_NAMES)
 plt.ylabel("True Label"); plt.xlabel("Predicted Label"); plt.tight_layout(); plt.show()
 print(f"\nFiles saved: phase3_best.pth, stat_scaler.pkl  → /kaggle/working/")
+
+# ── FEATURE CACHE IS NOW COMPLETE ────────────────────────────────────────────
+# At this point you have computed all 3 feature types across all phases.
+# If any of them were newly written to /kaggle/working this session, archive them
+# so the full feature dataset includes feats_mel/, feats_mfcc/, feats_stat/.
+import shutil
+for folder in ["feats_mel", "feats_mfcc", "feats_stat"]:
+    src = pathlib.Path("/kaggle/working") / folder
+    archive = f"/kaggle/working/{folder}_archive"
+    if src.exists() and any(src.glob("*.npy")):   # only archive if freshly computed this session
+        shutil.make_archive(archive, "zip", "/kaggle/working", folder)
+        sz = os.path.getsize(f"{archive}.zip") / 1e9
+        print(f"{folder}_archive.zip  ({sz:.2f} GB)  → /kaggle/working/")
+print("Upload all *_archive.zip files as a Kaggle dataset → next run will skip recomputation.")

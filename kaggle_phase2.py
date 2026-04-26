@@ -59,8 +59,29 @@ print("Device:", DEVICE)
 
 SR = 16000; DURATION_SEC = 2.75; BATCH_SIZE = 32; EPOCHS = 15
 NUM_WORKERS  = 4
-FEATS_DIR_MEL  = pathlib.Path("/kaggle/working/feats_mel")
-FEATS_DIR_MFCC = pathlib.Path("/kaggle/working/feats_mfcc")
+
+# ── FEATURE CACHE — AUTO-DETECT ──────────────────────────────────────────────
+# Upload your features dataset under your account (manarabdelshafy), any name.
+# The script finds feats_mel/ and feats_mfcc/ automatically — no config needed.
+# If not found, features are computed fresh (~53 min) and archived at the end.
+
+def _feat_dir(name: str) -> pathlib.Path:
+    """Auto-detect feature folder from any dataset by manarabdelshafy.
+    Falls back to /kaggle/working/<name> if not found."""
+    owner = pathlib.Path("/kaggle/input/datasets/manarabdelshafy")
+    if owner.exists():
+        for ds in sorted(owner.iterdir()):
+            if not ds.is_dir(): continue
+            candidate = ds / name
+            if candidate.exists() and any(candidate.glob("*.npy")):
+                print(f"[cache] '{name}' found at {candidate}  ✓  (skipping recomputation)")
+                return candidate
+    working = pathlib.Path("/kaggle/working") / name
+    print(f"[cache] '{name}' not in uploaded datasets → will compute to {working}")
+    return working
+
+FEATS_DIR_MEL  = _feat_dir("feats_mel")
+FEATS_DIR_MFCC = _feat_dir("feats_mfcc")
 CLASS_NAMES = ["Machine1_Normal","Machine1_Abnormal","Machine2_Normal",
                "Machine2_Abnormal","Machine3_Normal","Machine3_Abnormal"]
 
@@ -185,10 +206,16 @@ def _precompute_one_dual(args):
         np.save(mfcc_out, np.zeros((3, 40,  84), dtype=np.float32))
 
 def precompute_all_dual(paths, mel_dir, mfcc_dir, preprocessor, n_workers=4):
-    """Pre-compute mel + mfcc for every wav file. Skips already-saved files (resumable)."""
+    """Pre-compute mel + mfcc for every wav file. Skips already-saved files (resumable).
+    If either dir is under /kaggle/input (uploaded dataset), skips that dir entirely."""
     import multiprocessing, tqdm as tqdm_module
-    mel_dir  = pathlib.Path(mel_dir);  mel_dir.mkdir(parents=True, exist_ok=True)
-    mfcc_dir = pathlib.Path(mfcc_dir); mfcc_dir.mkdir(parents=True, exist_ok=True)
+    mel_dir  = pathlib.Path(mel_dir)
+    mfcc_dir = pathlib.Path(mfcc_dir)
+    # Dirs under /kaggle/input are read-only uploaded datasets — nothing to compute
+    if str(mel_dir).startswith("/kaggle/input") and str(mfcc_dir).startswith("/kaggle/input"):
+        print(f"[cache] mel+mfcc loaded from uploaded dataset  ✓"); return
+    mel_dir.mkdir(parents=True, exist_ok=True)
+    mfcc_dir.mkdir(parents=True, exist_ok=True)
     already = sum(1 for i in range(len(paths))
                   if (mel_dir/f"{i:06d}.npy").exists() and (mfcc_dir/f"{i:06d}.npy").exists())
     if already == len(paths):
@@ -434,4 +461,19 @@ print(f"Estimated 1 000 files : {ms_per_sample *  1000 / 1000:.2f} s")
 print(f"Estimated 10 000 files: {ms_per_sample * 10000 / 1000:.2f} s")
 
 plot_cm(preds,labels_t,CLASS_NAMES)
+
+# ── ARCHIVE MFCC FEATURES FOR REUSE IN PHASE 3 ───────────────────────────────
+# After this runs, download BOTH archives and add them to your features dataset:
+#   feats_mel_archive.zip  — if not already uploaded from Phase 1
+#   feats_mfcc_archive.zip — new from this phase
+# Re-upload the dataset with feats_mel/ + feats_mfcc/ inside.
+import shutil
+for folder, archive in [("feats_mel","feats_mel_archive"), ("feats_mfcc","feats_mfcc_archive")]:
+    src = pathlib.Path("/kaggle/working") / folder
+    if src.exists() and any(src.glob("*.npy")):   # only archive if freshly computed this session
+        print(f"Archiving {folder} ...")
+        shutil.make_archive(f"/kaggle/working/{archive}", "zip", "/kaggle/working", folder)
+        sz = os.path.getsize(f"/kaggle/working/{archive}.zip") / 1e9
+        print(f"  {archive}.zip  ({sz:.2f} GB)  → /kaggle/working/")
+
 print(f"\nDownload phase2_best.pth from /kaggle/working/ and upload as dataset 'phase2ckpt' for Phase 3.")

@@ -1,3 +1,3 @@
 # GearGossips
 
-1- DataSet URL ""
+##### Dataset Used URL "https://www.kaggle.com/datasets/mostafaehab41/machine-fault-dataset"

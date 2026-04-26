@@ -43,8 +43,28 @@ from scipy.signal import resample_poly
 ROOT_DIR    = "/kaggle/input/datasets/mostafaehab41/machine-fault-dataset"
 PHASE1_CKPT = "/kaggle/input/phase1ckpt/phase1_best.pth"   # ← CHANGE if your dataset name differs
 MODELS_DIR  = "/kaggle/working"
-FEATS_DIR_MEL  = pathlib.Path("/kaggle/working/feats_mel")   # reuse from Phase 1 if already cached
-FEATS_DIR_STAT = pathlib.Path("/kaggle/working/feats_stat")  # new for this phase
+
+# ── FEATURE CACHE — AUTO-DETECT ──────────────────────────────────────────────
+# Upload your features dataset under your account (manarabdelshafy), any name.
+# The script finds feats_mel/ and feats_stat/ automatically — no config needed.
+
+def _feat_dir(name: str) -> pathlib.Path:
+    """Auto-detect feature folder from any dataset by manarabdelshafy.
+    Falls back to /kaggle/working/<name> if not found."""
+    owner = pathlib.Path("/kaggle/input/datasets/manarabdelshafy")
+    if owner.exists():
+        for ds in sorted(owner.iterdir()):
+            if not ds.is_dir(): continue
+            candidate = ds / name
+            if candidate.exists() and any(candidate.glob("*.npy")):
+                print(f"[cache] '{name}' found at {candidate}  ✓  (skipping recomputation)")
+                return candidate
+    working = pathlib.Path("/kaggle/working") / name
+    print(f"[cache] '{name}' not in uploaded datasets → will compute to {working}")
+    return working
+
+FEATS_DIR_MEL  = _feat_dir("feats_mel")   # reuse from Phase 1 cache if available
+FEATS_DIR_STAT = _feat_dir("feats_stat")  # new for this phase
 
 print(f"ROOT_DIR    : {ROOT_DIR}")
 print(f"PHASE1_CKPT : {PHASE1_CKPT}")
@@ -201,8 +221,13 @@ def _precompute_one_mel_stat(args):
 
 def precompute_all_mel_stat(paths, mel_dir, stat_dir, preprocessor, n_workers=4):
     import multiprocessing, tqdm as tqdm_module
-    mel_dir  = pathlib.Path(mel_dir);  mel_dir.mkdir(parents=True, exist_ok=True)
-    stat_dir = pathlib.Path(stat_dir); stat_dir.mkdir(parents=True, exist_ok=True)
+    mel_dir  = pathlib.Path(mel_dir)
+    stat_dir = pathlib.Path(stat_dir)
+    # Read-only uploaded datasets — skip entirely
+    if str(mel_dir).startswith("/kaggle/input") and str(stat_dir).startswith("/kaggle/input"):
+        print("[cache] mel+stat loaded from uploaded dataset  ✓"); return
+    mel_dir.mkdir(parents=True, exist_ok=True)
+    stat_dir.mkdir(parents=True, exist_ok=True)
     already = sum(1 for i in range(len(paths))
                   if (mel_dir/f"{i:06d}.npy").exists() and (stat_dir/f"{i:06d}.npy").exists())
     if already == len(paths):
@@ -505,3 +530,15 @@ print(f"Phase 3  (All three) : run kaggle_phase3.py for the full ensemble")
 
 plot_cm(preds, labels, CLASS_NAMES)
 print(f"\nFiles saved: phase2b_best.pth, stat_scaler_2b.pkl  → /kaggle/working/")
+
+# ── ARCHIVE STAT FEATURES FOR REUSE ──────────────────────────────────────────
+# feats_stat is tiny (~1 MB for 56k files) but saves recomputation time.
+# Download feats_stat_archive.zip and add it to your features dataset alongside
+# feats_mel/ and feats_mfcc/ from Phases 1 & 2.
+import shutil
+for folder, archive in [("feats_mel","feats_mel_archive"), ("feats_stat","feats_stat_archive")]:
+    src = pathlib.Path("/kaggle/working") / folder
+    if src.exists() and any(src.glob("*.npy")):   # only archive if freshly computed this session
+        shutil.make_archive(f"/kaggle/working/{archive}", "zip", "/kaggle/working", folder)
+        sz = os.path.getsize(f"/kaggle/working/{archive}.zip") / 1e9
+        print(f"{archive}.zip  ({sz:.3f} GB)  → /kaggle/working/")
