@@ -2,17 +2,14 @@
 train_phase4b.py — Phase 4b: Mel + MFCC + [rms, zcr, rolloff, bandwidth, kurtosis]
 Run from project root: python train_phase4b.py
 
-Same idea as Phase 3, two changes:
-  - Centroid removed (Phase 3 ablation showed it hurt when added alone)
-  - Kurtosis added in its place — impulsive faults show up clearly as high kurtosis
+Adds an MFCC stream on top of Phase 2b (Mel + Stat, 99.93%).
 
-No ablation here. Phase 3 already mapped out which features help.
-We go straight to a single training run on the fixed 5-feature set.
-
-Weight transfer from phase3_best.pth:
-  _phase2 (mel + mfcc CNN)  ← fully transferred
-  fc1, fc2 (fusion head)    ← transferred (same shapes: 416→256, 256→6)
-  stat_branch               ← re-initialized (different feature semantics)
+Weight transfer from phase2b_best.pth:
+  mel_stream  ← transferred (already fine-tuned jointly with stat features)
+  stat_branch ← transferred (same 5 features, same order — no re-init needed)
+  fc2         ← transferred (same shape 256→6, warm class head)
+  mfcc_stream ← fresh init (new stream — doesn't exist in Phase 2b)
+  fc1         ← fresh init (288→256 in Phase 2b vs 416→256 here — shape mismatch)
 """
 
 import os, time, pickle, json, random
@@ -43,7 +40,7 @@ import machine_listener.src.train_utils as utils
 
 ROOT_DIR    = "Students"
 MODELS_DIR  = "machine_listener/outputs/saved_models"
-PHASE3_CKPT = os.path.join(MODELS_DIR, "phase3_best.pth")
+PHASE2B_CKPT = os.path.join(MODELS_DIR, "phase2b_best.pth")
 os.makedirs(MODELS_DIR, exist_ok=True)
 
 # feats_mel and feats_mfcc are reused from Phase 3 if they already exist
@@ -66,8 +63,8 @@ CLASS_NAMES = [
 ]
 
 print(f"Device: {DEVICE}")
-if not os.path.exists(PHASE3_CKPT):
-    raise FileNotFoundError(f"Phase 3 checkpoint not found at {PHASE3_CKPT}. Run train_phase3.py first.")
+if not os.path.exists(PHASE2B_CKPT):
+    raise FileNotFoundError(f"Phase 2b checkpoint not found at {PHASE2B_CKPT}. Run train_phase2b.py first.")
 
 # ---------- spec augment ---------------------------------------------------------
 
@@ -200,23 +197,36 @@ def eval_epoch(model, loader, criterion, device, s_mean, s_std):
             all_labels.extend(y.cpu().numpy())
     return total_loss / len(loader), correct / total, all_preds, all_labels
 
-def load_phase3_weights(model, ckpt_path, device):
-    """Transfer everything from Phase 3 except stat_branch.
+def load_phase2b_weights(model, ckpt_path, device):
+    """Transfer mel_stream, stat_branch, and fc2 from the Phase 2b checkpoint.
 
-    stat_branch weights aren't transferred because Phase 3 learned a different
-    feature set — better to start fresh for the new features.
-    Everything else (CNN + fusion head) transfers fine."""
+    Phase 2b (Mel + Stat, 99.93%) trained mel_stream jointly with the exact
+    same 5-feature stat set we use here — so both branches are already
+    calibrated for this feature set.
+
+    What transfers:
+      mel_stream  ✓  — fine-tuned with stat features, keeps that context
+      stat_branch ✓  — same 5 features [rms,zcr,rolloff,bw,kurtosis], same order
+      fc2         ✓  — same shape [256→6], warm class head
+
+    What does NOT transfer:
+      mfcc_stream   — doesn't exist in Phase 2b (fresh init, high LR)
+      fc1           — Phase 2b: Linear(288→256); Phase 4b: Linear(416→256)
+                      shape mismatch because mfcc adds 128-d to the concat
+    """
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(
+            f"Phase 2b checkpoint not found at {ckpt_path}. Run train_phase2b.py first.")
     sd = torch.load(ckpt_path, map_location=device)["model_state_dict"]
-    # Load all keys except stat_branch — strict=False handles missing keys cleanly
-    filtered = {k: v for k, v in sd.items() if not k.startswith("stat_branch.")}
-    missing, unexpected = model.load_state_dict(filtered, strict=False)
-    # missing should only be stat_branch keys — anything else is worth flagging
-    stat_keys   = [k for k in missing if k.startswith("stat_branch.")]
-    other_missing = [k for k in missing if not k.startswith("stat_branch.")]
-    print(f"Phase 3 weights loaded — {len(filtered)} keys transferred")
-    print(f"  stat_branch re-initialized ({len(stat_keys)} keys, expected)")
-    if other_missing:
-        print(f"  WARNING: unexpected missing keys: {other_missing}")
+    model.mel_stream.load_state_dict(
+        {k[len("mel_stream."):]: v for k, v in sd.items() if k.startswith("mel_stream.")})
+    model.stat_branch.load_state_dict(
+        {k[len("stat_branch."):]: v for k, v in sd.items() if k.startswith("stat_branch.")})
+    model.fc2.load_state_dict(
+        {k[len("fc2."):]: v for k, v in sd.items() if k.startswith("fc2.")})
+    print("Phase 2b weights loaded: mel_stream ✓  stat_branch ✓  fc2 ✓")
+    print("  mfcc_stream : fresh init (new stream — not in Phase 2b)")
+    print("  fc1         : fresh init (288→256 in Phase 2b vs 416→256 here)")
 
 # ---------- scan + precompute ----------------------------------------------------
 
@@ -236,11 +246,11 @@ precompute_features(ALL_PATHS, FEATS_MEL, FEATS_MFCC, FEATS_STAT_V2, _infer_prep
 split_file = pathlib.Path(MODELS_DIR) / "split_indices.json"
 if not split_file.exists():
     raise FileNotFoundError(
-        f"split_indices.json not found at {split_file}. Run train_phase3.py first "
+        f"split_indices.json not found at {split_file}. Run train_phase2b.py first "
         "to generate the split, then re-run this script.")
 _splits = json.load(open(split_file))
 
-stat_cols = [STAT_COL_V2[f] for f in STAT_FEATURES]   # [0, 1, 3, 4, 5]
+stat_cols = [STAT_COL_V2[f] for f in STAT_FEATURES]   # [0, 1, 2, 3, 4] — all 5 elements of stat_v2
 
 # ---------- build datasets -------------------------------------------------------
 
@@ -264,18 +274,20 @@ te_ldr = DataLoader(test_ds,  batch_size=BATCH_SIZE, shuffle=False, collate_fn=c
 # ---------- model + optimizer ----------------------------------------------------
 
 model = MelMFCCStatCNN(num_classes=6, stat_dim=len(STAT_FEATURES)).to(DEVICE)
-load_phase3_weights(model, PHASE3_CKPT, DEVICE)
+load_phase2b_weights(model, PHASE2B_CKPT, DEVICE)
 
-# CNN and fusion head came from Phase 3 (well-trained) — keep their LR very low.
-# stat_branch is starting from scratch — give it room to learn.
+# Differential learning rates:
+#   mel_stream  — transferred, already good → protect with very low LR
+#   stat_branch — transferred, already good → protect with very low LR
+#   mfcc_stream — fresh init → needs full LR to learn from scratch
+#   fc1         — fresh init (shape changed) → needs full LR
+#   fc2         — transferred but fc1 re-init shifts its input → medium LR
 optimizer = torch.optim.AdamW([
-    {"params": model._phase2.mel_stream.parameters(),   "lr": 5e-5},
-    {"params": model._phase2.mfcc_stream.parameters(),  "lr": 5e-5},
-    {"params": model._phase2.fc1.parameters(),          "lr": 5e-5},
-    {"params": model._phase2.fc2.parameters(),          "lr": 5e-5},
-    {"params": model.stat_branch.parameters(),          "lr": 5e-4},
-    {"params": model.fc1.parameters(),                  "lr": 2e-4},
-    {"params": model.fc2.parameters(),                  "lr": 2e-4},
+    {"params": model.mel_stream.parameters(),   "lr": 5e-5},
+    {"params": model.stat_branch.parameters(),  "lr": 5e-5},
+    {"params": model.mfcc_stream.parameters(),  "lr": 5e-4},
+    {"params": model.fc1.parameters(),          "lr": 5e-4},
+    {"params": model.fc2.parameters(),          "lr": 2e-4},
 ], weight_decay=1e-4)
 
 label_counts = np.bincount([ALL_LABELS[i] for i in _splits["train"]], minlength=6)
@@ -286,7 +298,7 @@ scheduler    = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=TRAIN
 # ---------- training loop --------------------------------------------------------
 
 print(f"\nTraining {TRAIN_EPOCHS} epochs on: {STAT_FEATURES}")
-print(f"Weights from: {PHASE3_CKPT}\n")
+print(f"Base weights : {PHASE2B_CKPT}\n")
 
 best_val  = 0.0
 ckpt_path = os.path.join(MODELS_DIR, "phase4b_best.pth")

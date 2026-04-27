@@ -10,28 +10,24 @@ Builds on Phase 3 with two changes:
 No ablation this time. Phase 3 already told us which features help.
 We go straight to fine-tuning on the fixed 5-feature set.
 
-What transfers from phase3_best.pth:
-  mel CNN (all 4 conv blocks)   — unchanged
-  MFCC CNN                      — unchanged
-  fusion fc1  (416 → 256)       — same shape, transfers
-  fusion fc2  (256 → 6)         — same shape, transfers
-  stat_branch                   — NOT transferred. Phase 3 had centroid at
-                                  position 2; we now have kurtosis there.
-                                  Same weight matrix shape [64,5] but the
-                                  meaning of each input neuron changed.
+Weight transfer from phase2b_best.pth:
+  mel_stream  — transferred (already fine-tuned jointly with stat features)
+  stat_branch — transferred (same 5 features [rms,zcr,rolloff,bw,kurtosis], same order)
+  fc2         — transferred (same shape 256→6, warm class head)
+  mfcc_stream — fresh init (new stream, not in Phase 2b)
+  fc1         — fresh init (288→256 in Phase 2b vs 416→256 here — shape mismatch)
 
 Feature cache:
-  feats_mel/   — reused from Phase 3 upload
-  feats_mfcc/  — reused from Phase 3 upload
-  feats_stat_v2/ — NEW: 5-element vector per file
+  feats_mel/    — reused from Phase 2b upload
+  feats_mfcc/   — NEW or reused from any prior phase that computed it
+  feats_stat_v2/ — reused from Phase 2b upload (same 5-element format)
                    [rms, zcr, rolloff, bandwidth, kurtosis]
-                   No centroid — it's redundant with what the mel CNN already knows.
 
 Before running:
   1. Add the machine-fault dataset (same as before)
-  2. Upload phase3_best.pth as a dataset (e.g. "phase3ckpt")
-  3. Upload feats_mel + feats_mfcc archives from Phase 3
-     (feats_stat_v2 will be computed fresh — it's fast, ~15 min)
+  2. Upload phase2b_best.pth as a dataset (e.g. "phase2b-best-pth")
+  3. Upload feats_mel + feats_stat_v2 archives from Phase 2b
+     (feats_mfcc will be computed fresh if not already cached — ~15 min)
 
 Output: phase4b_best.pth + stat_scaler_4b.pkl → /kaggle/working/
 """
@@ -67,11 +63,11 @@ def _find_machine_root(base):
     return str(p)
 
 ROOT_DIR    = _find_machine_root(_DATASET_BASE)
-PHASE3_CKPT = "/kaggle/input/datasets/manarabdelshafy/phase3ckpt/phase3_best.pth"
-MODELS_DIR  = "/kaggle/working"
+PHASE2B_CKPT = "/kaggle/input/datasets/manarabdelshafy/phase2b-best-pth/phase2b_best.pth"
+MODELS_DIR   = "/kaggle/working"
 
-print(f"ROOT_DIR    : {ROOT_DIR}")
-print(f"PHASE3_CKPT : {PHASE3_CKPT}  (exists: {pathlib.Path(PHASE3_CKPT).exists()})")
+print(f"ROOT_DIR     : {ROOT_DIR}")
+print(f"PHASE2B_CKPT : {PHASE2B_CKPT}  (exists: {pathlib.Path(PHASE2B_CKPT).exists()})")
 
 DEVICE     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SR         = 16000
@@ -463,21 +459,33 @@ def eval_one_epoch(model, loader, criterion, device, s_mean, s_std):
             all_labels.extend(y.cpu().numpy())
     return total_loss / len(loader), correct / total, all_preds, all_labels
 
-def load_phase3_weights(model, ckpt_path, device):
-    """Copy mel CNN, MFCC CNN, fc1 and fc2 from the Phase 3 checkpoint.
-    stat_branch is intentionally left at random init — Phase 3's weights
-    learned features in a specific order that no longer matches ours."""
+def load_phase2b_weights(model, ckpt_path, device):
+    """Transfer mel_stream, stat_branch, and fc2 from the Phase 2b checkpoint.
+
+    Phase 2b (Mel + Stat, 99.93%) trained mel_stream jointly with the exact
+    same 5-feature stat set we use here — so both mel_stream and stat_branch
+    are already well-calibrated for this feature set.
+
+    What transfers:
+      mel_stream  ✓  — fine-tuned with stat features, keeps that context
+      stat_branch ✓  — same 5 features [rms,zcr,rolloff,bw,kurtosis], same order
+      fc2         ✓  — same shape [256→6], warm class head
+
+    What does NOT transfer:
+      mfcc_stream   — doesn't exist in Phase 2b (fresh init, high LR)
+      fc1           — Phase 2b: Linear(288→256); Phase 4b: Linear(416→256)
+                      shape mismatch because mfcc adds 128-d to the concat
+    """
     sd = torch.load(ckpt_path, map_location=device)["model_state_dict"]
     model.mel_stream.load_state_dict(
         {k[len("mel_stream."):]: v for k, v in sd.items() if k.startswith("mel_stream.")})
-    model.mfcc_stream.load_state_dict(
-        {k[len("mfcc_stream."):]: v for k, v in sd.items() if k.startswith("mfcc_stream.")})
-    model.fc1.load_state_dict(
-        {k[len("fc1."):]: v for k, v in sd.items() if k.startswith("fc1.")})
+    model.stat_branch.load_state_dict(
+        {k[len("stat_branch."):]: v for k, v in sd.items() if k.startswith("stat_branch.")})
     model.fc2.load_state_dict(
         {k[len("fc2."):]: v for k, v in sd.items() if k.startswith("fc2.")})
-    print("Phase 3 weights loaded: mel_stream ✓  mfcc_stream ✓  fc1 ✓  fc2 ✓")
-    print("  stat_branch: fresh init (different features from Phase 3)")
+    print("Phase 2b weights loaded: mel_stream ✓  stat_branch ✓  fc2 ✓")
+    print("  mfcc_stream : fresh init (new stream — not in Phase 2b)")
+    print("  fc1         : fresh init (288→256 in Phase 2b vs 416→256 here)")
 
 def fit_scaler(stat_dir, indices, stat_cols):
     """Fast scaler fit — reads .npy files directly, no wav reads."""
@@ -500,7 +508,7 @@ _prep = AudioPreprocessor(PreprocessConfig(
 precompute(ALL_PATHS, FEATS_MEL, FEATS_MFCC, FEATS_STAT_V2, _prep, n_workers=WORKERS)
 
 _splits   = json.load(open(pathlib.Path(MODELS_DIR) / "split_indices.json"))
-stat_cols = [STAT_COL_V2[f] for f in STAT_FEATURES]   # [0,1,3,4,5]
+stat_cols = [STAT_COL_V2[f] for f in STAT_FEATURES]   # [0,1,2,3,4] — all 5 elements of stat_v2
 
 # Build datasets
 train_ds = CachedDataset(FEATS_MEL, FEATS_MFCC, FEATS_STAT_V2,
@@ -522,16 +530,20 @@ te_ldr = DataLoader(test_ds,  batch_size=BATCH_SIZE, shuffle=False, collate_fn=c
                     num_workers=WORKERS, pin_memory=True, persistent_workers=False, prefetch_factor=2)
 
 model = MelMFCCStatCNN(num_classes=6, stat_dim=len(STAT_FEATURES)).to(DEVICE)
-load_phase3_weights(model, PHASE3_CKPT, DEVICE)
+load_phase2b_weights(model, PHASE2B_CKPT, DEVICE)
 
-# Differential learning rates: everything we transferred gets a gentle LR
-# so we don't overwrite good CNN weights; the new stat_branch gets a proper LR.
+# Differential learning rates:
+#   mel_stream  — transferred, already good → protect with very low LR
+#   stat_branch — transferred, already good → protect with very low LR
+#   mfcc_stream — fresh init → needs full LR to learn from scratch
+#   fc1         — fresh init (shape changed) → needs full LR
+#   fc2         — transferred but fc1 re-init shifts its input → medium LR
 optimizer = torch.optim.AdamW([
     {"params": model.mel_stream.parameters(),   "lr": 5e-5},
-    {"params": model.mfcc_stream.parameters(),  "lr": 5e-5},
-    {"params": model.stat_branch.parameters(),  "lr": 5e-4},   # new branch, needs more updates
-    {"params": model.fc1.parameters(),           "lr": 2e-4},
-    {"params": model.fc2.parameters(),           "lr": 2e-4},
+    {"params": model.stat_branch.parameters(),  "lr": 5e-5},
+    {"params": model.mfcc_stream.parameters(),  "lr": 5e-4},
+    {"params": model.fc1.parameters(),          "lr": 5e-4},
+    {"params": model.fc2.parameters(),          "lr": 2e-4},
 ], weight_decay=1e-4)
 
 label_counts = np.bincount([ALL_LABELS[i] for i in _splits["train"]], minlength=6)
@@ -540,7 +552,7 @@ criterion    = nn.CrossEntropyLoss(
 scheduler    = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=TRAIN_EPOCHS)
 
 print(f"\nTraining {TRAIN_EPOCHS} epochs — features: {STAT_FEATURES}")
-print(f"stat_dim={len(STAT_FEATURES)}, differential LRs active\n")
+print(f"stat_dim={len(STAT_FEATURES)}  |  base: Phase 2b  |  differential LRs active\n")
 
 best_val = 0.0
 for epoch in range(1, TRAIN_EPOCHS + 1):
