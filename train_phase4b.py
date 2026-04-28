@@ -12,7 +12,7 @@ Weight transfer from phase2b_best.pth:
   fc1         ← fresh init (288→256 in Phase 2b vs 416→256 here — shape mismatch)
 """
 
-import os, time, pickle, json, random
+import os, time, pickle, random
 import pathlib
 import numpy as np
 import torch
@@ -21,11 +21,11 @@ from torch.utils.data import Dataset, DataLoader
 from concurrent.futures import ThreadPoolExecutor
 import matplotlib.pyplot as plt
 from sklearn.metrics import classification_report, confusion_matrix
-from sklearn.model_selection import train_test_split
 import seaborn as sns
 
 from machine_listener.src.preprocess import AudioPreprocessor, PreprocessConfig, AugmentationConfig
-from machine_listener.src.dataset import MachineDataset
+from machine_listener.src.dataset import scan_wav_files, SPLIT_DIR
+from machine_listener.src.split_utils import load_clean_split
 from machine_listener.src.features.mel_spectrogram import compute_mel_spectrogram
 from machine_listener.src.features.MFCC import compute_mfcc
 from machine_listener.src.features.statistical import (
@@ -234,21 +234,12 @@ _infer_prep = AudioPreprocessor(PreprocessConfig(
     target_sr=16000, default_duration_sec=2.75,
     augmentation=AugmentationConfig(enabled=False)))
 
-# Scan paths + labels using MachineDataset (feature_fn is never called here — we only need .paths/.labels)
-_scan_ds   = MachineDataset(ROOT_DIR, _infer_prep, lambda w: w, split="train")
-ALL_PATHS  = _scan_ds.paths
-ALL_LABELS = _scan_ds.labels
+ALL_PATHS, ALL_LABELS = scan_wav_files(ROOT_DIR)
 print(f"Found {len(ALL_PATHS)} files")
 
 precompute_features(ALL_PATHS, FEATS_MEL, FEATS_MFCC, FEATS_STAT_V2, _infer_prep, NUM_WORKERS)
 
-# Reuse the split from Phase 3 — same random seed so test set is identical
-split_file = pathlib.Path(MODELS_DIR) / "split_indices.json"
-if not split_file.exists():
-    raise FileNotFoundError(
-        f"split_indices.json not found at {split_file}. Run train_phase2b.py first "
-        "to generate the split, then re-run this script.")
-_splits = json.load(open(split_file))
+_splits = load_clean_split(SPLIT_DIR)
 
 stat_cols = [STAT_COL_V2[f] for f in STAT_FEATURES]   # [0, 1, 2, 3, 4] — all 5 elements of stat_v2
 

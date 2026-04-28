@@ -38,7 +38,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import confusion_matrix, f1_score, classification_report
 import pickle
 import librosa
@@ -48,6 +47,119 @@ from dataclasses import dataclass, field
 import soundfile as sf
 from scipy.signal import resample_poly
 from scipy.stats import kurtosis as scipy_kurtosis
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SPLIT UTILITIES — verbatim copy of split_utils.py logic, standalone for Kaggle
+# ══════════════════════════════════════════════════════════════════════════════
+import hashlib
+from collections import defaultdict as _ddict
+
+def _num_sort_key(f):
+    """Numeric-first sort: 1.wav < 2.wav < 10.wav. Non-integer names sort alphabetically."""
+    p = pathlib.Path(f)
+    try: return (0, int(p.stem), p.stem.lower())
+    except ValueError: return (1, 0, p.stem.lower())
+
+def _md5(path):
+    """MD5 hash — only computed when file sizes match; fast in practice."""
+    h = hashlib.md5()
+    with open(str(path), "rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""): h.update(chunk)
+    return h.hexdigest()
+
+def _find_duplicate_groups(paths):
+    """Group by (size, MD5). Returns {key: [idx, ...]} for groups >= 2."""
+    by_size = _ddict(list)
+    for i, p in enumerate(paths): by_size[pathlib.Path(p).stat().st_size].append(i)
+    groups = _ddict(list)
+    for size, idxs in by_size.items():
+        if len(idxs) < 2: continue
+        for i in idxs: groups[f"{size}:{_file_hash(paths[i])}"].append(i)
+    return {k: v for k, v in groups.items() if len(v) > 1}
+
+def _build_chronological_split(paths, labels, train_r=0.70, val_r=0.15):
+    """Sort numerically per class, force duplicates into the same split."""
+    dup_groups = _find_duplicate_groups(paths)
+    idx_to_key = {i: k for k, idxs in dup_groups.items() for i in idxs}
+    if dup_groups:
+        n = sum(len(v) for v in dup_groups.values())
+        print(f"[split] {len(dup_groups)} duplicate groups ({n} files) — all copies go to same split")
+    else:
+        print("[split] No duplicates found")
+    by_class = _ddict(list)
+    for i, lbl in enumerate(labels): by_class[lbl].append(i)
+    dup_assigned = {}; all_train, all_val, all_test = [], [], []
+    for cls_id in sorted(by_class):
+        cls_idxs = sorted(by_class[cls_id], key=lambda i: _num_sort_key(paths[i]))
+        n = len(cls_idxs); n_tr = int(train_r * n); n_va = int(val_r * n)
+        for rank, gidx in enumerate(cls_idxs):
+            nat = "train" if rank < n_tr else ("val" if rank < n_tr + n_va else "test")
+            k = idx_to_key.get(gidx)
+            if k is not None:
+                asgn = dup_assigned.setdefault(k, nat)
+                if asgn != nat:
+                    print(f"[split]   dup-fix: {pathlib.Path(paths[gidx]).name} {nat}->{asgn}")
+            else:
+                asgn = nat
+            (all_train if asgn == "train" else all_val if asgn == "val" else all_test).append(gidx)
+    return all_train, all_val, all_test
+
+def _verify_split(paths, labels, tr, va, te):
+    by_class = _ddict(list)
+    for i, lbl in enumerate(labels): by_class[lbl].append(i)
+    tr_s, te_s = set(tr), set(te)
+    bp = sum(1 for idxs in by_class.values()
+             for a, b in zip(sorted(idxs, key=lambda i: _num_sort_key(paths[i]))[:-1],
+                             sorted(idxs, key=lambda i: _num_sort_key(paths[i]))[1:])
+             if (a in tr_s and b in te_s) or (a in te_s and b in tr_s))
+    print(f"[split] Train={len(tr)}  Val={len(va)}  Test={len(te)}  Boundary_pairs={bp} (target=0)")
+    if bp == 0: print("[split] Zero temporal leakage")
+    else: print(f"[split] {bp} boundary pairs (caused by duplicate-fix)")
+
+def _create_clean_split(paths, labels, split_dir, train_r=0.70, val_r=0.15):
+    """Build, verify, and save the split. Called once from Phase 1."""
+    split_dir = pathlib.Path(split_dir)
+    split_dir.mkdir(parents=True, exist_ok=True)
+    tr, va, te = _build_chronological_split(paths, labels, train_r, val_r)
+    _verify_split(paths, labels, tr, va, te)
+    result = {"train": tr, "val": va, "test": te}
+    out = split_dir / "split_indices_clean.json"
+    json.dump(result, open(out, "w"))
+    print(f"[split] Saved -> {out}")
+    return result
+
+def _load_clean_split(split_dir):
+    """Load split_indices_clean.json. Raises FileNotFoundError if not found."""
+    path = pathlib.Path(split_dir) / "split_indices_clean.json"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"split_indices_clean.json not found at {path}. "
+            "Run kaggle_phase1.py first to create it.")
+    return json.load(open(path))
+# ══════════════════════════════════════════════════════════════════════════════
+
+_LABEL_MAP = {
+    ("machine1", "Normal"): 0, ("machine1", "Abnormal"): 1,
+    ("machine2", "Normal"): 2, ("machine2", "Abnormal"): 3,
+    ("machine3", "Normal"): 4, ("machine3", "Abnormal"): 5,
+}
+
+def _scan_wav_files(root_dir):
+    """Return (paths, labels) for all labelled .wav files under root_dir."""
+    paths, labels = [], []
+    for wav in sorted(pathlib.Path(root_dir).rglob("*.wav")):
+        state   = wav.parent.name
+        machine = wav.parent.parent.name
+        lbl = _LABEL_MAP.get((machine, state))
+        if lbl is not None:
+            paths.append(wav)
+            labels.append(lbl)
+    if not paths:
+        raise RuntimeError(
+            f"No labelled .wav files found under {root_dir}. "
+            "Expected: machineX/Normal/*.wav and machineX/Abnormal/*.wav")
+    print(f"Found {len(paths)} files")
+    return paths, labels
 
 # ---------- paths ----------------------------------------------------------------
 
@@ -301,44 +413,6 @@ def precompute(paths, mel_dir, mfcc_dir, stat_dir, prep, n_workers=4):
 
 # ---------- dataset --------------------------------------------------------------
 
-class MachineScanner(Dataset):
-    """Just scans the folder and builds the split — not used for actual training."""
-    LABEL_MAP = {("machine1", "Normal"): 0, ("machine1", "Abnormal"): 1,
-                 ("machine2", "Normal"): 2, ("machine2", "Abnormal"): 3,
-                 ("machine3", "Normal"): 4, ("machine3", "Abnormal"): 5}
-
-    def __init__(self, root_dir, split):
-        self.root_dir = pathlib.Path(root_dir)
-        self.paths, self.labels = self._scan()
-        self.indices = self._split(split)
-
-    def _scan(self):
-        paths, labels = [], []
-        for f in self.root_dir.rglob("*.wav"):
-            lbl = self.LABEL_MAP.get((f.parent.parent.name, f.parent.name))
-            if lbl is not None:
-                paths.append(f); labels.append(lbl)
-        if not paths:
-            raise RuntimeError(f"No labelled wav files found under {self.root_dir}")
-        print(f"Found {len(paths)} files")
-        return paths, labels
-
-    def _split(self, split):
-        sf_path = pathlib.Path(MODELS_DIR) / "split_indices.json"
-        if sf_path.exists():
-            return json.load(open(sf_path))[split]
-        idx = list(range(len(self.paths)))
-        tr, tmp, _, tl = train_test_split(idx, self.labels, test_size=0.30,
-                                          stratify=self.labels, random_state=42)
-        va, te = train_test_split(tmp, test_size=0.50, stratify=tl, random_state=42)
-        json.dump({"train": tr, "val": va, "test": te}, open(sf_path, "w"))
-        print(f"Split saved → {sf_path}")
-        return {"train": tr, "val": va, "test": te}[split]
-
-    def __len__(self):  return len(self.indices)
-    def __getitem__(self, i): pass   # training uses CachedDataset below
-
-
 class CachedDataset(Dataset):
     """Loads mel + mfcc + stat from .npy files. No wav reads during training."""
     def __init__(self, mel_dir, mfcc_dir, stat_dir, labels, indices, stat_cols, augment=False):
@@ -495,10 +569,8 @@ def fit_scaler(stat_dir, indices, stat_cols):
 
 # ---------- main -----------------------------------------------------------------
 
-# Scan files and build/load the train/val/test split
-scanner   = MachineScanner(ROOT_DIR, "train")
-ALL_PATHS  = scanner.paths
-ALL_LABELS = scanner.labels
+# Scan all files
+ALL_PATHS, ALL_LABELS = _scan_wav_files(ROOT_DIR)
 
 # Precompute features. feats_mel + feats_mfcc are reused from Phase 3 if uploaded.
 # feats_stat_v2 gets computed now (~15 min for 56k files).
@@ -507,7 +579,7 @@ _prep = AudioPreprocessor(PreprocessConfig(
     augmentation=AugmentationConfig(enabled=False)))
 precompute(ALL_PATHS, FEATS_MEL, FEATS_MFCC, FEATS_STAT_V2, _prep, n_workers=WORKERS)
 
-_splits   = json.load(open(pathlib.Path(MODELS_DIR) / "split_indices.json"))
+_splits = _load_clean_split(MODELS_DIR)
 stat_cols = [STAT_COL_V2[f] for f in STAT_FEATURES]   # [0,1,2,3,4] — all 5 elements of stat_v2
 
 # Build datasets
