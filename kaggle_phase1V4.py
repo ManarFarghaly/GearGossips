@@ -1,5 +1,6 @@
+# phase V4 
 """
-PHASE 1 — Mel-Spectrogram → 2D CNN  (v3 — Machine3 collapse fix) 
+PHASE 1 — Mel-Spectrogram → 2D CNN
 ══════════════════════════════════════════════════════════════════════
 
 DIAGNOSIS from v2 results:
@@ -76,7 +77,6 @@ import seaborn as sns
 # ══════════════════════════════════════════════════════════════════════════════
 import hashlib
 from collections import defaultdict as _ddict
-
 def _num_sort_key(f):
     p = pathlib.Path(f)
     try: return (0, int(p.stem), p.stem.lower())
@@ -204,7 +204,7 @@ import wandb
 wandb.init(
     project="machine-fault-phase1",
     config={
-        "version": "v3",
+        "version": "v4",
         "batch_size": BATCH_SIZE,
         "lr": LR,
         "epochs": EPOCHS,

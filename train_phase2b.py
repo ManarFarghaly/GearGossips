@@ -2,8 +2,8 @@
 Phase 2b — Mel-Spectrogram + Statistical Features (no MFCC)
 Run from project root: python train_phase2b.py
 
-Tests whether replacing the MFCC stream with cheap global statistics gives
-comparable accuracy at lower inference cost.
+Loads Phase 1 (V1) checkpoint. Fine-tunes MelStatCNN with a flat 6-class head,
+global stat normalization, differential LRs, and ENS class weights.
 
   Phase 2  : Mel + MFCC  →  ~0.49 ms/sample
   Phase 2b : Mel + Stat  →  ~0.25 ms/sample  (this script measures it)
@@ -12,7 +12,7 @@ Features: rms, zcr, rolloff, bandwidth, kurtosis
   Centroid dropped — redundant with mel CNN's frequency representations.
   Kurtosis added — standard vibration fault indicator (impulsive signal bursts).
 
-Single 25-epoch fine-tune with differential LRs from a Phase 1 checkpoint.
+For the V2 version (hierarchical heads, focal loss, RLROP), use train_phase2bV2.py.
 """
 
 import os
@@ -52,10 +52,14 @@ FEATS_DIR_STAT = os.path.normpath(os.path.join(MODELS_DIR, "..", "features", "st
 os.makedirs(FEATS_DIR_MEL,  exist_ok=True)
 os.makedirs(FEATS_DIR_STAT, exist_ok=True)
 
-DEVICE       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-BATCH_SIZE   = 32
-TRAIN_EPOCHS = 25
-NUM_WORKERS  = 2
+DEVICE        = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+BATCH_SIZE    = 32
+TRAIN_EPOCHS  = 25
+NUM_WORKERS   = 2
+WEIGHT_DECAY  = 1e-4
+LABEL_SMOOTH  = 0.1
+ENS_BETA      = 0.9999
+ES_PATIENCE   = 5
 
 STAT_FEATURES = ALL_FEATURE_NAMES_V2   # ["rms", "zcr", "rolloff", "bandwidth", "kurtosis"]
 
@@ -233,8 +237,13 @@ precompute_mel_stat(ALL_PATHS, FEATS_DIR_MEL, FEATS_DIR_STAT, _infer_prep, n_wor
 # ── Step 3: build datasets and fit scaler ────────────────────────────────────
 
 label_counts  = np.bincount([ALL_LABELS[i] for i in _splits["train"]], minlength=6)
-class_weights = torch.tensor(1.0 / (label_counts + 1), dtype=torch.float32).to(DEVICE)
-print(f"Label counts: {label_counts}")
+# ENS weights — more principled than 1/(n+1) for imbalanced datasets
+eff_num       = (1.0 - np.power(ENS_BETA, label_counts)) / (1.0 - ENS_BETA)
+ens_w         = 1.0 / eff_num
+ens_w         = ens_w / ens_w.sum() * 6
+class_weights = torch.tensor(ens_w, dtype=torch.float32).to(DEVICE)
+print(f"Label counts : {label_counts}")
+print(f"ENS weights  : {ens_w.round(4)}")
 
 tr_ds = PrecomputedDatasetMelStat(FEATS_DIR_MEL, FEATS_DIR_STAT, ALL_LABELS, _splits["train"], augment=True)
 vl_ds = PrecomputedDatasetMelStat(FEATS_DIR_MEL, FEATS_DIR_STAT, ALL_LABELS, _splits["val"],   augment=False)
@@ -266,8 +275,10 @@ optimizer = torch.optim.AdamW([
     {"params": model.fc2.parameters(),         "lr": 5e-4},
 ], weight_decay=1e-4)
 
-criterion = nn.CrossEntropyLoss(weight=class_weights)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=TRAIN_EPOCHS)
+criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=LABEL_SMOOTH)
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer, mode="min", factor=0.5, patience=2, min_lr=1e-6
+)
 
 # ── Step 5: training loop ─────────────────────────────────────────────────────
 
@@ -276,33 +287,54 @@ print(f"  Phase 2b — Mel + Stat  ({TRAIN_EPOCHS} epochs, differential LRs)")
 print(f"  Features: {STAT_FEATURES}")
 print(f"══════════════════════════════════════════════════════════════\n")
 
-best_val  = 0.0
-history   = {"train_acc": [], "val_acc": []}
-ckpt_path = os.path.join(MODELS_DIR, "phase2b_best.pth")
+best_val_loss = float("inf")
+best_val_acc  = 0.0
+es_counter    = 0
+history       = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
+ckpt_path     = os.path.join(MODELS_DIR, "phase2b_best.pth")
+
+print(f"\n── Training Phase 2b — Mel + Stat (flat head, global norm) ──")
+print(f"   ENS β={ENS_BETA} | LabelSmooth ε={LABEL_SMOOTH} | ES patience={ES_PATIENCE}")
+print()
 
 for epoch in range(1, TRAIN_EPOCHS + 1):
     tr_l, tr_a       = train_epoch_ms(model, tr_ldr, optimizer, criterion, DEVICE, sm, ss)
     vl_l, vl_a, _, _ = eval_epoch_ms( model, vl_ldr, criterion, DEVICE, sm, ss)
-    scheduler.step()
+    scheduler.step(vl_l)
 
-    history["train_acc"].append(tr_a)
-    history["val_acc"].append(vl_a)
+    history["train_loss"].append(tr_l); history["train_acc"].append(tr_a)
+    history["val_loss"].append(vl_l);   history["val_acc"].append(vl_a)
 
-    saved = ""
-    if vl_a > best_val:
-        best_val = vl_a
+    improved = vl_l < best_val_loss
+    tag = ""
+    if improved:
+        best_val_loss = vl_l
+        best_val_acc  = vl_a
+        es_counter    = 0
         torch.save({
             "model_state_dict": model.state_dict(),
             "epoch":            epoch,
+            "val_loss":         vl_l,
             "val_acc":          vl_a,
             "stat_features":    STAT_FEATURES,
             "stat_dim":         len(STAT_FEATURES),
+            "scaler_mean":      sm,
+            "scaler_std":       ss,
         }, ckpt_path)
-        saved = "  ← saved"
+        tag = "  ← saved"
+    else:
+        es_counter += 1
+        tag = f"  (patience {es_counter}/{ES_PATIENCE})"
 
-    print(f"Epoch {epoch:3d}/{TRAIN_EPOCHS}  train={tr_a:.4f}  val={vl_a:.4f}{saved}")
+    print(f"Epoch {epoch:3d}/{TRAIN_EPOCHS}  "
+          f"train_loss={tr_l:.4f}  train_acc={tr_a:.4f}  "
+          f"val_loss={vl_l:.4f}  val_acc={vl_a:.4f}{tag}")
 
-print(f"\nBest val accuracy: {best_val:.4f}")
+    if es_counter >= ES_PATIENCE:
+        print(f"\n[early stop] Stopping after {ES_PATIENCE} epochs without improvement.")
+        break
+
+print(f"\nBest val loss: {best_val_loss:.4f}  (val acc: {best_val_acc:.4f})")
 
 # ── Step 6: save scaler + test evaluation ─────────────────────────────────────
 # Checkpoint keys: model_state_dict · epoch · val_acc · stat_features · stat_dim

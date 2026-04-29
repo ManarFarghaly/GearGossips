@@ -1,23 +1,18 @@
 """
 Global statistical feature extractor — one scalar per clip.
 
-Original 5 (Phase 3):
-  rms       — overall signal energy
-  zcr       — how often the waveform crosses zero (noise vs tonal content)
-  centroid  — frequency "center of mass" (brightness) — mostly redundant with mel CNN
-  rolloff   — freq below which 85% of energy sits (low vs high frequency content)
-  bandwidth — spread of spectrum around centroid (tonal vs broadband)
+v1 features (Phase 3):
+  rms, zcr, centroid, rolloff, bandwidth
 
-Added in Phase 4b:
-  kurtosis  — tailedness of amplitude distribution. Faulty machines produce
-              impulsive bursts → high kurtosis. Normal operation is smoother → low kurtosis.
-              This is the standard vibration-analysis fault indicator (ISO 13373).
+v2 features (Phase 2b/4b) — centroid dropped (redundant with mel CNN), kurtosis added:
+  rms, zcr, rolloff, bandwidth, kurtosis
 
-The full v2 ordering (used for .npy caching) is:
-  [rms(0), zcr(1), centroid(2), rolloff(3), bandwidth(4), kurtosis(5)]
+v3 features (ablation) — full set including spectral_flux:
+  rms, zcr, rolloff, bandwidth, kurtosis, spectral_flux
+  spectral_flux: mean frame-to-frame spectral change; catches irregular fault patterns
+  without the "already impulsive baseline" problem kurtosis has for Machine2.
 
-All values are RAW — you must StandardScaler-normalize before feeding to the model.
-Scale differences are huge (RMS ≈ 0.1, spectral centroid ≈ 3000).
+All values are RAW — normalise before passing to the model.
 """
 
 import librosa
@@ -25,15 +20,17 @@ import numpy as np
 from scipy.stats import kurtosis as scipy_kurtosis
 
 
-# Original 5 — kept for backward compatibility with Phase 3
+# v1 — kept for backward compatibility
 ALL_FEATURE_NAMES = ["rms", "zcr", "centroid", "rolloff", "bandwidth"]
 
-# v2 set: centroid dropped (redundant with mel CNN), kurtosis added (fault indicator)
-# Used by Phase 2b and Phase 4b onwards
+# v2 — centroid dropped, kurtosis added
 ALL_FEATURE_NAMES_V2 = ["rms", "zcr", "rolloff", "bandwidth", "kurtosis"]
 
-# Column index lookup for v2 — use this instead of hardcoding integers
+# v3 — full 6-feature set for ablation (superset, slice to get any subset)
+ALL_FEATURE_NAMES_V3 = ["rms", "zcr", "rolloff", "bandwidth", "kurtosis", "spectral_flux"]
+
 STAT_COL_V2 = {name: i for i, name in enumerate(ALL_FEATURE_NAMES_V2)}
+STAT_COL_V3 = {name: i for i, name in enumerate(ALL_FEATURE_NAMES_V3)}
 
 
 def compute_statistical_features(
@@ -72,11 +69,14 @@ def compute_statistical_features(
             val = float(librosa.feature.spectral_bandwidth(y=waveform, sr=sr).mean())
 
         elif name == "kurtosis":
-            # Fisher's excess kurtosis: normal distribution = 0, impulsive faults > 0
             val = float(scipy_kurtosis(waveform, fisher=True))
 
+        elif name == "spectral_flux":
+            S = np.abs(librosa.stft(waveform, n_fft=1024, hop_length=512))
+            val = float(np.mean(np.sum(np.diff(S, axis=1) ** 2, axis=0)))
+
         else:
-            raise ValueError(f"Unknown feature '{name}'. Valid: {ALL_FEATURE_NAMES_V2}")
+            raise ValueError(f"Unknown feature '{name}'. Valid: {ALL_FEATURE_NAMES_V3}")
 
         result.append(val)
 
@@ -84,7 +84,12 @@ def compute_statistical_features(
 
 
 def compute_stat_features_v2(waveform: np.ndarray, sr: int = 16000) -> np.ndarray:
-    """Compute all 5 v2 features for .npy caching.
-    Returns float32 array of shape (5,): [rms, zcr, rolloff, bandwidth, kurtosis]
-    """
+    """All 5 v2 features: [rms, zcr, rolloff, bandwidth, kurtosis]"""
     return compute_statistical_features(waveform, sr, ALL_FEATURE_NAMES_V2)
+
+
+def compute_stat_features_v3(waveform: np.ndarray, sr: int = 16000) -> np.ndarray:
+    """All 6 v3 features: [rms, zcr, rolloff, bandwidth, kurtosis, spectral_flux]
+    Use this for the ablation cache — precompute once, then slice whichever subset you need.
+    """
+    return compute_statistical_features(waveform, sr, ALL_FEATURE_NAMES_V3)
