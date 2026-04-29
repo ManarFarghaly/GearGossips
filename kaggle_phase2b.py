@@ -306,7 +306,7 @@ def compute_stat_v2(waveform, sr=16000):
         float(scipy_kurtosis(waveform, fisher=True)),
     ], dtype=np.float32)
 
-def spec_augment(mel, freq_mask=30, time_mask=15, n_freq=2, n_time=2):
+def spec_augment(mel, freq_mask=30, time_mask=20, n_freq=2, n_time=2):
     mel=mel.clone(); _,F,T=mel.shape
     for _ in range(n_freq):
         f=random.randint(0,freq_mask); f0=random.randint(0,max(F-f,1)); mel[:,f0:f0+f,:]=0.0
@@ -465,7 +465,7 @@ precompute_all_mel_stat(ALL_PATHS, FEATS_DIR_MEL, FEATS_DIR_STAT, _infer_prep, n
 _splits = _load_clean_split(MODELS_DIR)
 
 label_counts  = np.bincount([ALL_LABELS[i] for i in _splits["train"]], minlength=6)
-class_weights = torch.tensor(1.0/(label_counts+1), dtype=torch.float32).to(DEVICE)
+class_weights = torch.tensor(1.0/np.maximum(label_counts,1), dtype=torch.float32).to(DEVICE)
 
 # Build datasets
 tr_ds = PrecomputedDatasetMS(FEATS_DIR_MEL, FEATS_DIR_STAT, ALL_LABELS, _splits["train"], augment=True)

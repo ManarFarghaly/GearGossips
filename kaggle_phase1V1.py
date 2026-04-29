@@ -330,7 +330,7 @@ def compute_mel_spectrogram(waveform, sr=16000):
 # Randomly masks horizontal bands (frequency) and vertical bands (time).
 # Paper: "SpecAugment: A Simple Data Augmentation Method for ASR" (Park et al. 2019)
 import random
-def spec_augment(mel, freq_mask=30, time_mask=15, n_freq=2, n_time=2):
+def spec_augment(mel, freq_mask=30, time_mask=20, n_freq=2, n_time=2):
     """
     mel : torch.Tensor (1, 128, 84)
     Masks up to `freq_mask` frequency rows and `time_mask` time columns.
@@ -434,7 +434,7 @@ class PrecomputedDataset(Dataset):
 
     def __getitem__(self, idx):
         ri  = self.indices[idx]
-        mel = np.load(self.feats_dir / f"{ri:06d}.npy")          # (1,128,84) float32
+        mel = np.load(self.feats_dir / f"{ri:06d}.npy",mmap_mode="r")          # (1,128,84) float32
         mel_t = torch.tensor(mel, dtype=torch.float32)
         if self.augment:
             mel_t = spec_augment(mel_t)                           # fast tensor masking
@@ -557,7 +557,7 @@ test_loader  = DataLoader(test_ds,  batch_size=BATCH_SIZE, shuffle=False,
 
 # Compute class weights to handle any class imbalance
 label_counts  = np.bincount([ALL_LABELS[i] for i in _splits["train"]], minlength=6)
-class_weights = torch.tensor(1.0 / (label_counts + 1), dtype=torch.float32).to(DEVICE)
+class_weights = torch.tensor(1.0 / np.maximum(label_counts, 1), dtype=torch.float32).to(DEVICE)
 
 model     = MelCNN(num_classes=6).to(DEVICE)
 criterion = nn.CrossEntropyLoss(weight=class_weights)

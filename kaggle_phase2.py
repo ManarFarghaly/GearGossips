@@ -289,7 +289,7 @@ def compute_mfcc(waveform, sr=16000):
     for i in range(3): feats[i]=_minmax(feats[i])
     return feats.astype(np.float32)
 
-def spec_augment(mel, freq_mask=30, time_mask=15, n_freq=2, n_time=2):
+def spec_augment(mel, freq_mask=30, time_mask=20, n_freq=2, n_time=2):
     """Mask random frequency and time bands on a mel tensor. Zero CPU cost vs librosa augmentation."""
     mel = mel.clone()
     _, F, T = mel.shape
@@ -479,7 +479,7 @@ optimizer = torch.optim.AdamW([
 ], weight_decay=1e-4)
 
 label_counts  = np.bincount([ALL_LABELS[i] for i in _splits["train"]], minlength=6)
-class_weights = torch.tensor(1.0/(label_counts+1), dtype=torch.float32).to(DEVICE)
+class_weights = torch.tensor(1.0/np.maximum(label_counts,1), dtype=torch.float32).to(DEVICE)
 criterion     = nn.CrossEntropyLoss(weight=class_weights)
 scheduler     = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
 

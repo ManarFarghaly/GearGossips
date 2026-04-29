@@ -296,7 +296,7 @@ def compute_statistical_features(waveform, sr=16000, feature_names=None):
         elif name=="bandwidth":result.append(float(librosa.feature.spectral_bandwidth(y=waveform,sr=sr).mean()))
     return np.array(result,dtype=np.float32)
 
-def spec_augment(mel, freq_mask=30, time_mask=15, n_freq=2, n_time=2):
+def spec_augment(mel, freq_mask=30, time_mask=20, n_freq=2, n_time=2):
     """Mask random frequency and time bands on a mel tensor. Zero CPU cost vs librosa augmentation."""
     mel = mel.clone()
     _, F, T = mel.shape
