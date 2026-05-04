@@ -1,5 +1,5 @@
 """
-Phase 2b — statistical feature ablation
+Phase 2b (ablation)— statistical feature ablation
 
 Caches all 6 stat features once, then runs 5 configs that each use a different
 subset. All other settings are fixed (Phase 1 V2 checkpoint, global norm,

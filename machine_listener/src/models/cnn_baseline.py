@@ -49,9 +49,6 @@ class MelCNN(nn.Module):
         self.fc2     = nn.Linear(256, num_classes)    # 256  → 6
 
     def extract_features(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        added for Phase 2 calls this so it can plug the mel-stream into a larger model.
-        """
         x = self.block1(x)
         x = self.block2(x)
         x = self.block3(x)

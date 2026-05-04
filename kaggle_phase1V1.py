@@ -1,19 +1,10 @@
-"""
-PHASE 1 — Mel-Spectrogram → 2D CNN Baseline                 
-Before running:                                             
-    1. Upload Machine-Fault-Dataset a Kaggle dataset into input    
-    2. Set ROOT_DIR below to the correct /kaggle/input/ path  
-    3. GPU must be ON (Settings → Accelerator → GPU T4 x2)                                                              
-Output: phase1_best.pth saved to /kaggle/working/           
-        Download it and upload as a dataset for Phase 2     
-"""
 import shutil
 
 shutil.make_archive("/kaggle/working/output", 'zip', "/kaggle/working")
 
 print("Zipped everything to /kaggle/working/output.zip")                    # → lists everything in working dir
 
-#  0. Install / imports 
+
 import os, json, math, re, pathlib, time
 import numpy as np
 import torch
@@ -24,10 +15,6 @@ from sklearn.metrics import confusion_matrix, f1_score, classification_report
 import librosa
 import matplotlib.pyplot as plt
 import seaborn as sns
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SPLIT UTILITIES — verbatim copy of split_utils.py logic, standalone for Kaggle
-# ══════════════════════════════════════════════════════════════════════════════
 import hashlib
 from collections import defaultdict as _ddict
 
@@ -113,7 +100,7 @@ def _load_clean_split(split_dir):
             f"split_indices_clean.json not found at {path}. "
             "Run kaggle_phase1.py first to create it.")
     return json.load(open(path))
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 
 _LABEL_MAP = {
     ("machine1", "Normal"): 0, ("machine1", "Abnormal"): 1,

@@ -1,27 +1,3 @@
-"""
-Phase 1 V3 — Mel-Spectrogram CNN  (Machine3 collapse fix)
-Run from project root: python train_phase1V3.py
-
-Changes vs V2:
-  [FIX A] Hierarchical dual-head loss (machine-ID + fault-status)
-           Forces the backbone to learn both machine-discriminative AND
-           fault-discriminative features. Flat 6-class head can satisfy
-           the loss by learning machine ID while ignoring fault status.
-  [FIX B] Focal loss (γ = 2.0) on the binary fault-status head
-           Down-weights easy samples so hard Machine3 Normal/Abnormal
-           pairs receive larger gradients.
-  [FIX C] ReduceLROnPlateau replaces cosine annealing
-           Holds peak LR while Machine3 is still learning; reduces only
-           when val_loss stagnates.
-  [FIX D] Mixup alpha 0.3 → 0.1
-           Aggressive mixing creates ambiguous Machine3 samples; 0.1 keeps
-           lambda > 0.85 in 90% of samples so signal stays clean.
-  [KEPT]  ENS weights, label smoothing, SpecAugment, warmup, early stopping
-  [KEPT]  Gradient clipping max_norm=1.0
-
-Output: phase1_v3_best.pth  (used by train_phase2bV2.py)
-"""
-
 import os
 import time
 import random
@@ -33,15 +9,13 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 from sklearn.metrics import classification_report, f1_score
-
+import tqdm
 from machine_listener.src.preprocess import AudioPreprocessor, PreprocessConfig, AugmentationConfig
 from machine_listener.src.dataset import scan_wav_files, SPLIT_DIR
 from machine_listener.src.features.mel_spectrogram import compute_mel_spectrogram
 from machine_listener.src.models.cnn_baseline import MelCNNHier
 from machine_listener.src.split_utils import load_clean_split
 import machine_listener.src.train_utils as utils
-
-# ── Config ────────────────────────────────────────────────────────────────────
 
 ROOT_DIR   = "Students"
 MODELS_DIR = "machine_listener/outputs/saved_models"
@@ -79,7 +53,7 @@ MACHINE_NAMES = ["Machine1", "Machine2", "Machine3"]
 
 print(f"Device: {DEVICE}")
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+
 
 def spec_augment(mel, freq_mask=27, time_mask=15, n_freq=2, n_time=2):
     mel = mel.clone()
@@ -108,7 +82,7 @@ def _precompute_mel_one(args):
 
 
 def precompute_mel(paths, feats_dir, preprocessor, n_workers=4):
-    import tqdm
+
     feats_dir = pathlib.Path(feats_dir)
     feats_dir.mkdir(parents=True, exist_ok=True)
     already = sum(1 for i in range(len(paths)) if (feats_dir / f"{i:06d}.npy").exists())
@@ -234,7 +208,7 @@ def eval_epoch_v3(model, loader, crit_main, device):
     return total_loss / len(loader), correct / total, all_preds, all_labels
 
 
-# ── Step 1: scan files and load split ────────────────────────────────────────
+
 
 _infer_prep = AudioPreprocessor(PreprocessConfig(
     target_sr=16000, default_duration_sec=2.75, trim_silence=True, normalize_mode="peak",
@@ -246,11 +220,10 @@ print(f"Found {len(ALL_PATHS)} files")
 
 _splits = load_clean_split(SPLIT_DIR)
 
-# ── Step 2: pre-compute mel-specs ─────────────────────────────────────────────
 
 precompute_mel(ALL_PATHS, FEATS_DIR_MEL, _infer_prep, n_workers=NUM_WORKERS)
 
-# ── Step 3: datasets, loaders, class weights ──────────────────────────────────
+
 
 label_counts  = np.bincount([ALL_LABELS[i] for i in _splits["train"]], minlength=6)
 class_weights = effective_num_weights(label_counts, beta=ENS_BETA).to(DEVICE)
@@ -291,7 +264,6 @@ test_loader  = DataLoader(test_ds,  batch_size=BATCH_SIZE, shuffle=False,
                           num_workers=NUM_WORKERS, pin_memory=True,
                           persistent_workers=True, prefetch_factor=2)
 
-# ── Step 4: model and loss functions ─────────────────────────────────────────
 
 model = MelCNNHier(num_classes=6).to(DEVICE)
 
@@ -306,7 +278,6 @@ plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
     optimizer, mode="min", factor=RLROP_FACTOR, patience=RLROP_PATIENCE, min_lr=1e-5
 )
 
-# ── Step 5: training loop ─────────────────────────────────────────────────────
 
 best_val_loss = float("inf")
 best_val_acc  = 0.0
@@ -366,7 +337,6 @@ for epoch in range(1, EPOCHS + 1):
 
 print(f"\nBest val loss: {best_val_loss:.4f}  (val acc: {best_val_acc:.4f})")
 
-# ── Step 6: test evaluation ───────────────────────────────────────────────────
 
 ckpt = torch.load(ckpt_path, map_location=DEVICE)
 model.load_state_dict(ckpt["model_state_dict"])
@@ -399,7 +369,6 @@ print(f"Estimated 10 000 files: {ms_per_sample * 10000 / 1000:.2f} s")
 
 utils.plot_confusion_matrix(test_preds, test_labels, CLASS_NAMES)
 
-# ── Training curves ───────────────────────────────────────────────────────────
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
 ax1.plot(history["train_loss"], label="train"); ax1.plot(history["val_loss"], label="val")
 ax1.set_title("Loss"); ax1.set_xlabel("Epoch"); ax1.legend()

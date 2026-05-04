@@ -1,18 +1,12 @@
 """
 Global statistical feature extractor — one scalar per clip.
 
-v1 features (Phase 3):
-  rms, zcr, centroid, rolloff, bandwidth
+v1 features (Phase 3): rms, zcr, centroid, rolloff, bandwidth
+v2 features (Phase 2b): rms, zcr, rolloff, bandwidth, kurtosis
+v3 features (ablation): rms, zcr, rolloff, bandwidth, kurtosis, spectral_flux
+v4 features (Phase 2b V3/V4): rms, zcr, rolloff, bandwidth, spectral_flux, kurtosis, mfcc_1..13
 
-v2 features (Phase 2b/4b) — centroid dropped (redundant with mel CNN), kurtosis added:
-  rms, zcr, rolloff, bandwidth, kurtosis
-
-v3 features (ablation) — full set including spectral_flux:
-  rms, zcr, rolloff, bandwidth, kurtosis, spectral_flux
-  spectral_flux: mean frame-to-frame spectral change; catches irregular fault patterns
-  without the "already impulsive baseline" problem kurtosis has for Machine2.
-
-All values are RAW — normalise before passing to the model.
+All values are raw — normalise before passing to the model.
 """
 
 import librosa
@@ -28,6 +22,12 @@ ALL_FEATURE_NAMES_V2 = ["rms", "zcr", "rolloff", "bandwidth", "kurtosis"]
 
 # v3 — full 6-feature set for ablation (superset, slice to get any subset)
 ALL_FEATURE_NAMES_V3 = ["rms", "zcr", "rolloff", "bandwidth", "kurtosis", "spectral_flux"]
+
+# v4 — 19 features: 6 spectral/temporal descriptors + 13 MFCCs
+ALL_FEATURE_NAMES_V4 = (
+    ["rms", "zcr", "rolloff", "bandwidth", "spectral_flux", "kurtosis"] +
+    [f"mfcc_{i}" for i in range(1, 14)]
+)
 
 STAT_COL_V2 = {name: i for i, name in enumerate(ALL_FEATURE_NAMES_V2)}
 STAT_COL_V3 = {name: i for i, name in enumerate(ALL_FEATURE_NAMES_V3)}
@@ -89,7 +89,21 @@ def compute_stat_features_v2(waveform: np.ndarray, sr: int = 16000) -> np.ndarra
 
 
 def compute_stat_features_v3(waveform: np.ndarray, sr: int = 16000) -> np.ndarray:
-    """All 6 v3 features: [rms, zcr, rolloff, bandwidth, kurtosis, spectral_flux]
-    Use this for the ablation cache — precompute once, then slice whichever subset you need.
-    """
+    """All 6 v3 features: [rms, zcr, rolloff, bandwidth, kurtosis, spectral_flux]"""
     return compute_statistical_features(waveform, sr, ALL_FEATURE_NAMES_V3)
+
+
+def compute_stat_features_v4(waveform: np.ndarray, sr: int = 16000) -> np.ndarray:
+    """All 19 v4 features: rms, zcr, rolloff, bandwidth, spectral_flux, kurtosis, mfcc_1..13"""
+    S    = np.abs(librosa.stft(waveform, n_fft=1024, hop_length=512))
+    flux = float(np.mean(np.sum(np.diff(S, axis=1) ** 2, axis=0)))
+    mfcc = librosa.feature.mfcc(y=waveform, sr=sr, n_mfcc=13).mean(axis=1)
+    base = np.array([
+        float(np.sqrt(np.mean(waveform ** 2))),
+        float(librosa.feature.zero_crossing_rate(waveform).mean()),
+        float(librosa.feature.spectral_rolloff(y=waveform, sr=sr).mean()),
+        float(librosa.feature.spectral_bandwidth(y=waveform, sr=sr).mean()),
+        flux,
+        float(scipy_kurtosis(waveform, fisher=True)),
+    ], dtype=np.float32)
+    return np.concatenate([base, mfcc.astype(np.float32)])

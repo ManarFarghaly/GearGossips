@@ -13,11 +13,11 @@ def train_epoch(model,optimizer,criterion,loader,device):
 
     for x,y in loader:
         x,y = x.to(device),y.to(device)
-        optimizer.zero_grad() # zero out the gradients from the previous step, otherwise they will accumulate and affect the current step
-        out = model(x) # save the output 
-        loss = criterion(out,y) # calculate the loss 
-        loss.backward() 
-        optimizer.step() # update the model parameters based on the calculated gradients
+        optimizer.zero_grad()
+        out = model(x)
+        loss = criterion(out, y)
+        loss.backward()
+        optimizer.step()
 
         total_loss += loss.item()
         preds = torch.argmax(out,dim = 1)
@@ -36,7 +36,7 @@ def eval_epoch(model, loader, criterion, device):
     all_preds = []
     all_labels = []
     for x,y in loader:
-        x,y = x.to(device),y.to(device)    # FIX: was x.to_device() — no such method
+        x, y = x.to(device), y.to(device)
         out = model(x)
         loss = criterion(out,y)
         total_loss += loss.item()

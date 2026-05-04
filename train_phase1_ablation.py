@@ -1,16 +1,3 @@
-"""
-Phase 1 ablation — local version
-Run from project root: python train_phase1_ablation.py
-
-Same 5 configs as kaggle_phase1_ablation.py. See that file for the full description.
-
-  A  baseline     flat head, CE (uniform), cosine LR
-  B  +ens+ls      ENS weights + label smoothing + warmup
-  C  +mixup       B + Mixup α=0.1
-  D  +hier+focal  C + hierarchical heads + focal loss on fault head
-  E  +rlrop       D + ReduceLROnPlateau replacing cosine
-"""
-
 import os, random, pathlib, time
 from dataclasses import dataclass
 import numpy as np
@@ -20,15 +7,14 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import f1_score, classification_report
 import matplotlib.pyplot as plt
-
+import tqdm
+from concurrent.futures import ThreadPoolExecutor
 from machine_listener.src.preprocess import AudioPreprocessor, PreprocessConfig, AugmentationConfig
 from machine_listener.src.dataset import scan_wav_files, SPLIT_DIR
 from machine_listener.src.features.mel_spectrogram import compute_mel_spectrogram
 from machine_listener.src.models.cnn_baseline import MelCNN, MelCNNHier
 from machine_listener.src.split_utils import create_clean_split, load_clean_split
 import machine_listener.src.train_utils as utils
-
-# ── Config ────────────────────────────────────────────────────────────────────
 
 ROOT_DIR   = "Students"
 MODELS_DIR = "machine_listener/outputs/saved_models"
@@ -52,8 +38,6 @@ _MACHINE_FROM_CLASS = {0:0, 1:0, 2:1, 3:1, 4:2, 5:2}
 _FAULT_FROM_CLASS   = {0:0, 1:1, 2:0, 3:1, 4:0, 5:1}
 
 print(f"Device: {DEVICE}")
-
-# ── Ablation configs ──────────────────────────────────────────────────────────
 
 @dataclass
 class AblCfg:
@@ -79,7 +63,6 @@ CONFIGS = [
             mixup_alpha=0.1, use_focal=True,  use_rlrop=True,  use_warmup=True),
 ]
 
-# ── Spec augment ──────────────────────────────────────────────────────────────
 
 def spec_augment(mel, freq_mask=27, time_mask=15, n_freq=2, n_time=2):
     mel = mel.clone()
@@ -94,11 +77,7 @@ def spec_augment(mel, freq_mask=27, time_mask=15, n_freq=2, n_time=2):
         mel[:, :, t0:t0+t] = 0.0
     return mel
 
-# ── Pre-computation ───────────────────────────────────────────────────────────
-
 def precompute_mel(paths, feats_dir, preprocessor, n_workers=4):
-    import tqdm
-    from concurrent.futures import ThreadPoolExecutor
     feats_dir = pathlib.Path(feats_dir)
     feats_dir.mkdir(parents=True, exist_ok=True)
     done = sum(1 for i in range(len(paths)) if (feats_dir / f"{i:06d}.npy").exists())
@@ -114,8 +93,6 @@ def precompute_mel(paths, feats_dir, preprocessor, n_workers=4):
     with ThreadPoolExecutor(max_workers=n_workers) as ex:
         list(tqdm.tqdm(ex.map(_one, enumerate(paths)), total=len(paths), desc="mel"))
     print("Done.")
-
-# ── Dataset ───────────────────────────────────────────────────────────────────
 
 class MelDataset(Dataset):
     def __init__(self, feats_dir, labels, indices, augment=False):
@@ -134,8 +111,6 @@ class MelDataset(Dataset):
                 torch.tensor(_MACHINE_FROM_CLASS[lbl], dtype=torch.long),
                 torch.tensor(_FAULT_FROM_CLASS[lbl],   dtype=torch.long))
 
-# ── Loss / weights ────────────────────────────────────────────────────────────
-
 class BinaryFocalLoss(nn.Module):
     def __init__(self, gamma=2.0, pos_weight=None):
         super().__init__()
@@ -143,8 +118,7 @@ class BinaryFocalLoss(nn.Module):
 
     def forward(self, logits, targets):
         t   = targets.float().unsqueeze(1)
-        bce = F.binary_cross_entropy_with_logits(logits, t,
-                                                  pos_weight=self.pos_weight, reduction="none")
+        bce = F.binary_cross_entropy_with_logits(logits, t,pos_weight=self.pos_weight, reduction="none")
         return ((1.0 - torch.exp(-bce)) ** self.gamma * bce).mean()
 
 def effective_num_weights(label_counts, beta=0.9999, num_classes=6):
@@ -183,8 +157,6 @@ def build_schedulers(cfg, optimizer):
                   optimizer, T_max=MAX_EPOCHS, eta_min=1e-5))
     return warmup, main
 
-# ── Mixup ─────────────────────────────────────────────────────────────────────
-
 def mixup_batch(x, y, alpha, device):
     if alpha <= 0: return x, y, y, 1.0
     lam  = float(np.random.beta(alpha, alpha))
@@ -195,7 +167,6 @@ def mixup_batch(x, y, alpha, device):
 def mixup_loss(crit, pred, ya, yb, lam):
     return lam * crit(pred, ya) + (1-lam) * crit(pred, yb)
 
-# ── Train / eval ──────────────────────────────────────────────────────────────
 
 def train_epoch(model, loader, optimizer, cfg,
                 crit_main, crit_machine, crit_fault, device):
@@ -274,8 +245,6 @@ def run_training(model, tr_ldr, vl_ldr, optimizer, cfg,
         if es >= ES_PATIENCE:
             print(f"  Early stop at epoch {epoch}."); break
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-
 _infer_prep = AudioPreprocessor(PreprocessConfig(
     target_sr=16000, default_duration_sec=2.75,
     augmentation=AugmentationConfig(enabled=False),
@@ -283,7 +252,6 @@ _infer_prep = AudioPreprocessor(PreprocessConfig(
 ALL_PATHS, ALL_LABELS = scan_wav_files(ROOT_DIR)
 print(f"Found {len(ALL_PATHS)} files")
 
-# Load or create split — all configs must use the same split
 split_file = pathlib.Path(SPLIT_DIR) / "split_indices_clean.json"
 if split_file.exists():
     _splits = load_clean_split(SPLIT_DIR)
@@ -339,7 +307,6 @@ for cfg in CONFIGS:
     print(f"\n  Test  macro_f1={macro:.4f}  acc={acc:.4f}")
     print(classification_report(test_labels, test_preds, target_names=CLASS_NAMES))
 
-# ── Summary table ─────────────────────────────────────────────────────────────
 
 print(f"\n{'Config':<16} {'M1N':>5} {'M1A':>5} {'M2N':>5} {'M2A':>5} {'M3N':>5} {'M3A':>5} {'Macro':>7} {'Acc':>6}")
 print("-" * 68)

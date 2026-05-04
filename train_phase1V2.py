@@ -1,17 +1,3 @@
-"""
-Phase 1 V2 — Mel-Spectrogram CNN  (overfitting + imbalance fixes)
-Run from project root: python train_phase1V2.py
-
-Changes vs V1:
-  [FIX 1] Effective Number of Samples class weights  (Cui et al., CVPR 2019)
-  [FIX 2] Label smoothing ε = 0.1  (Müller et al., NeurIPS 2019)
-  [FIX 3] SpecAugment params calibrated to paper proportions  (Park et al., 2019)
-  [FIX 4] Mixup augmentation α = 0.3  (Zhang et al., ICLR 2018)
-  [FIX 5] Linear warmup (2 epochs) + CosineAnnealingLR
-  [FIX 6] Early stopping on val_loss, patience = 4  (Prechelt, 1998)
-  [KEPT]  Flat 6-class head, same MelCNN architecture as V1
-"""
-
 import os
 import time
 import random
@@ -22,7 +8,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 from sklearn.metrics import classification_report, f1_score
-
+import tqdm
 from machine_listener.src.preprocess import AudioPreprocessor, PreprocessConfig, AugmentationConfig
 from machine_listener.src.dataset import scan_wav_files, SPLIT_DIR
 from machine_listener.src.features.mel_spectrogram import compute_mel_spectrogram
@@ -30,7 +16,6 @@ from machine_listener.src.models.cnn_baseline import MelCNN
 from machine_listener.src.split_utils import load_clean_split
 import machine_listener.src.train_utils as utils
 
-# ── Config ────────────────────────────────────────────────────────────────────
 
 ROOT_DIR   = "Students"
 MODELS_DIR = "machine_listener/outputs/saved_models"
@@ -59,7 +44,6 @@ CLASS_NAMES = [
 
 print(f"Device: {DEVICE}")
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def spec_augment(mel, freq_mask=27, time_mask=15, n_freq=2, n_time=2):
     """Paper-calibrated params: freq_mask=27 on 128 bins (~21%), time_mask=15."""
@@ -89,7 +73,6 @@ def _precompute_mel_one(args):
 
 
 def precompute_mel(paths, feats_dir, preprocessor, n_workers=4):
-    import tqdm
     feats_dir = pathlib.Path(feats_dir)
     feats_dir.mkdir(parents=True, exist_ok=True)
     already = sum(1 for i in range(len(paths)) if (feats_dir / f"{i:06d}.npy").exists())
@@ -167,8 +150,6 @@ def train_epoch_v2(model, loader, optimizer, criterion, device, mixup_alpha):
     return total_loss / len(loader), correct / total
 
 
-# ── Step 1: scan files and load split ────────────────────────────────────────
-
 _infer_prep = AudioPreprocessor(PreprocessConfig(
     target_sr=16000, default_duration_sec=2.75, trim_silence=True, normalize_mode="peak",
     augmentation=AugmentationConfig(enabled=False),
@@ -179,11 +160,8 @@ print(f"Found {len(ALL_PATHS)} files")
 
 _splits = load_clean_split(SPLIT_DIR)
 
-# ── Step 2: pre-compute mel-specs ─────────────────────────────────────────────
-
 precompute_mel(ALL_PATHS, FEATS_DIR_MEL, _infer_prep, n_workers=NUM_WORKERS)
 
-# ── Step 3: datasets, loaders, class weights ──────────────────────────────────
 
 label_counts  = np.bincount([ALL_LABELS[i] for i in _splits["train"]], minlength=6)
 class_weights = effective_num_weights(label_counts, beta=ENS_BETA).to(DEVICE)
@@ -205,17 +183,13 @@ test_loader  = DataLoader(test_ds,  batch_size=BATCH_SIZE, shuffle=False,
                           num_workers=NUM_WORKERS, pin_memory=True,
                           persistent_workers=True, prefetch_factor=2)
 
-# ── Step 4: model, optimizer, criterion ──────────────────────────────────────
-
 model     = MelCNN(num_classes=6).to(DEVICE)
 optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=LABEL_SMOOTH)
 
-# [FIX 5] Warmup + CosineAnnealingLR
 warmup_scheduler  = make_warmup_scheduler(optimizer, warmup_epochs=WARMUP_EPOCHS)
 cosine_scheduler  = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
 
-# ── Step 5: training loop ─────────────────────────────────────────────────────
 
 best_val_loss = float("inf")
 best_val_acc  = 0.0
@@ -269,8 +243,6 @@ for epoch in range(1, EPOCHS + 1):
 
 print(f"\nBest val loss: {best_val_loss:.4f}  (val acc: {best_val_acc:.4f})")
 
-# ── Step 6: test evaluation ───────────────────────────────────────────────────
-
 ckpt = torch.load(ckpt_path, map_location=DEVICE)
 model.load_state_dict(ckpt["model_state_dict"])
 
@@ -299,7 +271,6 @@ print(f"Estimated 10 000 files: {ms_per_sample * 10000 / 1000:.2f} s")
 
 utils.plot_confusion_matrix(test_preds, test_labels, CLASS_NAMES)
 
-# ── Training curves ───────────────────────────────────────────────────────────
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
 ax1.plot(history["train_loss"], label="train"); ax1.plot(history["val_loss"], label="val")
 ax1.set_title("Loss"); ax1.set_xlabel("Epoch"); ax1.legend()

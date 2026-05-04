@@ -1,24 +1,12 @@
 """
 Phase 2b — Mel-Spectrogram CNN + Statistical features branch.
 
-A lightweight alternative to Phase 2 (MelMFCCCNN):
-  • Keeps the mel_stream from Phase 1 (transfer learning)
-  • Adds a tiny FC branch for global statistical descriptors
-  • Skips the MFCC CNN stream  →  ~same inference cost as Phase 1
-
-Why this might work well:
-  • Statistical features (RMS, ZCR, centroid, rolloff, BW) directly encode
-    machine health indicators that CNNs need many layers to learn implicitly.
-  • Adding them for "free" (< 0.001 s per sample) can close accuracy gaps
-    without the 2× inference cost of the MFCC stream.
-
 Architecture:
   mel_stream  → 256-d  (MelCNN.extract_features — loaded from Phase 1)
-  stat_branch →  32-d  (Linear(stat_dim→64)→ReLU→Linear(64→32)→ReLU)
+  stat_branch →  32-d  (Linear(stat_dim→64) → ReLU → Linear(64→32) → ReLU)
   concat      → 288-d  → fc1(288→256) → Dropout(0.4) → fc2(256→6)
 
-NOTE: stat features must be StandardScaler-normalised before passing in.
-      The scaler is fitted on training data and saved to stat_scaler_2b.pkl.
+Stat features must be StandardScaler-normalised before passing in.
 """
 
 import torch

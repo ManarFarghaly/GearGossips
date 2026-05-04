@@ -1,13 +1,13 @@
 """
-PHASE 2b — Mel-Spectrogram + Statistical Features with kurtosis  (Phase 2 but instead of global norma we did per machine one)
+PHASE 2b (V2) — Mel-Spectrogram + Statistical Features with kurtosis  (Phase 2 but instead of global norma we did per machine one)
 ═══════════════════════════════════════════════════════════════════════════════════
 Changes from the original phase2b:
 
 [FIX 0] ReduceLROnPlateau verbose=True removed — keyword dropped in PyTorch ≥ 2.2.
          LR is logged every epoch via wandb instead.
 
-[FIX 1] Loads from Phase 1 v3 (hierarchical head architecture).
-         Phase 1 v3 has three heads: head_main, head_machine, head_fault.
+[FIX 1] Loads from Phase 1 v4 (hierarchical head architecture).
+         Phase 1 v4 has three heads: head_main, head_machine, head_fault.
          Phase 2b only needs the CNN backbone (mel_stream). We load the
          backbone weights by strict=False + key remapping, so both v1/v2/v3
          phase1 checkpoints work transparently.

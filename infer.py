@@ -1,17 +1,30 @@
 """
-Final Inference Script — infer.py
+infer.py — Machine Fault Recognition inference script
 Usage: python infer.py <path_to_data_directory>
 
-Reads all *.wav files from data/ in numeric order (1.wav, 2.wav, ...),
-runs the Phase 3 model on each, and writes:
-  results.txt  — one predicted label (0-5) per line
-  time.txt     — one processing time (seconds, 3 dp) per line
+Reads all *.wav files from the given directory in numeric order (1.wav, 2.wav, ...),
+runs the Phase 2b V4 model on each, and writes two output files:
+  results.txt — one predicted label (0–5) per line
+  time.txt    — one processing time (seconds, 3 dp) per line
 
-The model file (phase3_best.pth) and scaler file (stat_scaler.pkl) must be
-in the same directory as this script, or set MODEL_PATH / SCALER_PATH below.
+The model checkpoint (phase2b_v4_best.pth) must be in the same directory as
+this script. It embeds the per-machine scalers and feature list so no separate
+scaler file is needed.
+
+Labels:
+  0 = Machine 1, Normal      1 = Machine 1, Abnormal
+  2 = Machine 2, Normal      3 = Machine 2, Abnormal
+  4 = Machine 3, Normal      5 = Machine 3, Abnormal
 """
 
-import sys, os, re, time, math, pathlib, json, pickle
+import sys
+import os
+import re
+import time
+import math
+import pathlib
+import pickle
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -19,186 +32,306 @@ import torch.nn.functional as F
 import librosa
 import soundfile as sf
 from scipy.signal import resample_poly
-from dataclasses import dataclass, field
+from scipy.stats import kurtosis as scipy_kurtosis
 
-#  PATHS 
-HERE        = pathlib.Path(__file__).parent
-MODEL_PATH  = HERE / "phase3_best.pth"
-SCALER_PATH = HERE / "stat_scaler.pkl"
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
 
-#  PREPROCESSING 
+HERE       = pathlib.Path(__file__).parent
+MODEL_PATH = HERE / "phase2b_v4_best.pth"
+
+# ---------------------------------------------------------------------------
+# Preprocessing
+# ---------------------------------------------------------------------------
+
 EPSILON = 1e-8
 
-@dataclass
-class AugmentationConfig:
-    enabled: bool = False   # always off at inference
+TARGET_SR   = 16000
+DURATION    = 2.75                          # seconds
+TARGET_LEN  = int(round(TARGET_SR * DURATION))  # 44 000 samples
 
-@dataclass
-class PreprocessConfig:
-    target_sr: int = 16000; default_duration_sec: float = 2.75
-    trim_silence: bool = True; silence_threshold_ratio: float = 0.02
-    trim_frame_ms: int = 20; trim_hop_ms: int = 10; min_retained_sec: float = 0.25
-    denoise: bool = False; normalize_mode: str = "peak"; peak_target: float = 0.95
-    clip_value: float = 1.0; augmentation: AugmentationConfig = field(default_factory=AugmentationConfig)
+SILENCE_THRESHOLD_RATIO = 0.02
+TRIM_FRAME_MS           = 20
+TRIM_HOP_MS             = 10
+MIN_RETAINED_SEC        = 0.25
+PEAK_TARGET             = 0.95
 
-class AudioPreprocessor:
-    def __init__(self, config=None): self.config = config or PreprocessConfig()
-    def preprocess(self, audio_path, **_):
-        cfg=self.config; eff_sr=cfg.target_sr; tgt_len=int(round(eff_sr*cfg.default_duration_sec))
-        try: data,orig_sr=sf.read(str(audio_path),always_2d=False,dtype="float32")
-        except: return np.zeros(tgt_len,dtype=np.float32)
-        w=np.asarray(data,dtype=np.float32)
-        if w.ndim>1: w=w.mean(axis=1)
-        if orig_sr!=eff_sr:
-            d=math.gcd(orig_sr,eff_sr); w=resample_poly(w,eff_sr//d,orig_sr//d).astype(np.float32)
-        if cfg.trim_silence and w.size>0:
-            peak=np.abs(w).max()
-            if peak>EPSILON:
-                thr=peak*cfg.silence_threshold_ratio; fl=max(1,int(eff_sr*cfg.trim_frame_ms/1000)); hl=max(1,int(eff_sr*cfg.trim_hop_ms/1000))
-                aw=np.abs(w); active=[s for s in range(0,w.size-fl+1,hl) if aw[s:s+fl].max()>=thr]
-                if active:
-                    trimmed=w[active[0]:min(w.size,active[-1]+fl)]
-                    if trimmed.size>=int(cfg.min_retained_sec*eff_sr): w=trimmed.astype(np.float32)
-        p=np.abs(w).max()
-        if p>EPSILON: w=w*(cfg.peak_target/p)
-        cur=w.size
-        if cur>tgt_len: w=w[(cur-tgt_len)//2:(cur-tgt_len)//2+tgt_len]
-        elif cur<tgt_len: w=np.pad(w,(0,tgt_len-cur))
-        np.clip(w,-cfg.clip_value,cfg.clip_value,out=w)
-        return w.astype(np.float32)
 
-#  FEATURE FUNCTIONS ─
-def _mm(S):
-    lo,hi=S.min(),S.max()
-    return np.zeros_like(S) if hi-lo<1e-8 else (S-lo)/(hi-lo)
+def _load_audio(path):
+    """Read a wav file and return (samples float32, original_sr)."""
+    try:
+        data, orig_sr = sf.read(str(path), always_2d=False, dtype="float32")
+    except Exception:
+        return np.zeros(TARGET_LEN, dtype=np.float32), TARGET_SR
+    w = np.asarray(data, dtype=np.float32)
+    if w.ndim > 1:
+        w = w.mean(axis=1)
+    return w, orig_sr
 
-def compute_mel_spectrogram(w,sr=16000):
-    mel=librosa.feature.melspectrogram(y=w,sr=sr,n_mels=128,n_fft=1024,hop_length=512,fmin=50,fmax=8000,center=False)
-    return np.expand_dims(_mm(librosa.power_to_db(mel,ref=np.max)).astype(np.float32),0)
 
-def compute_mfcc(w,sr=16000):
-    mfcc=librosa.feature.mfcc(y=w,sr=sr,n_mfcc=40,n_fft=1024,hop_length=512)
-    d=librosa.feature.delta(mfcc); d2=librosa.feature.delta(mfcc,order=2)
-    feats=np.stack([mfcc,d,d2],axis=0)
-    for i in range(3): feats[i]=_mm(feats[i])
-    return feats.astype(np.float32)
+def _resample(w, orig_sr, target_sr):
+    if orig_sr == target_sr:
+        return w
+    d = math.gcd(orig_sr, target_sr)
+    return resample_poly(w, target_sr // d, orig_sr // d).astype(np.float32)
 
-def compute_statistical_features(w, sr=16000, feature_names=None):
-    if feature_names is None: feature_names=["rms","zcr","centroid","rolloff","bandwidth"]
-    result=[]
-    for name in feature_names:
-        if name=="rms":        result.append(float(np.sqrt(np.mean(w**2))))
-        elif name=="zcr":      result.append(float(librosa.feature.zero_crossing_rate(w).mean()))
-        elif name=="centroid": result.append(float(librosa.feature.spectral_centroid(y=w,sr=sr).mean()))
-        elif name=="rolloff":  result.append(float(librosa.feature.spectral_rolloff(y=w,sr=sr).mean()))
-        elif name=="bandwidth":result.append(float(librosa.feature.spectral_bandwidth(y=w,sr=sr).mean()))
-    return np.array(result,dtype=np.float32)
 
-#  MODELS (must match Phase 3 architecture exactly) ─
+def _trim_silence(w, sr):
+    if w.size == 0:
+        return w
+    peak = np.abs(w).max()
+    if peak <= EPSILON:
+        return w
+    thr = peak * SILENCE_THRESHOLD_RATIO
+    fl  = max(1, int(sr * TRIM_FRAME_MS / 1000))
+    hl  = max(1, int(sr * TRIM_HOP_MS   / 1000))
+    active = [s for s in range(0, w.size - fl + 1, hl)
+              if np.abs(w[s:s + fl]).max() >= thr]
+    if not active:
+        return w
+    trimmed = w[active[0]: min(w.size, active[-1] + fl)]
+    if trimmed.size >= int(MIN_RETAINED_SEC * sr):
+        return trimmed.astype(np.float32)
+    return w
+
+
+def _peak_normalize(w):
+    p = np.abs(w).max()
+    if p > EPSILON:
+        w = w * (PEAK_TARGET / p)
+    return w.astype(np.float32)
+
+
+def _fix_length(w, tgt):
+    cur = w.size
+    if cur > tgt:
+        start = (cur - tgt) // 2
+        return w[start: start + tgt]
+    if cur < tgt:
+        return np.pad(w, (0, tgt - cur))
+    return w
+
+
+def preprocess(raw_w, orig_sr):
+    """Full preprocessing pipeline: resample, trim, normalize, fix length."""
+    w = _resample(raw_w, orig_sr, TARGET_SR)
+    w = _trim_silence(w, TARGET_SR)
+    w = _peak_normalize(w)
+    w = _fix_length(w, TARGET_LEN)
+    np.clip(np.nan_to_num(w, 0.0), -1.0, 1.0, out=w)
+    return w.astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Feature extraction
+# ---------------------------------------------------------------------------
+
+def _minmax(S):
+    lo, hi = S.min(), S.max()
+    return np.zeros_like(S) if hi - lo < 1e-8 else (S - lo) / (hi - lo)
+
+
+def compute_mel(w, sr=TARGET_SR):
+    """Returns (1, 128, 84) mel-spectrogram."""
+    mel = librosa.feature.melspectrogram(
+        y=w, sr=sr, n_mels=128, n_fft=1024, hop_length=512,
+        fmin=50, fmax=8000, center=False
+    )
+    return np.expand_dims(_minmax(librosa.power_to_db(mel, ref=np.max)).astype(np.float32), 0)
+
+
+def compute_stat(w, sr=TARGET_SR):
+    """Returns 19-d statistical feature vector used by Phase 2b V3/V4."""
+    S    = np.abs(librosa.stft(w, n_fft=1024, hop_length=512))
+    flux = float(np.mean(np.sum(np.diff(S, axis=1) ** 2, axis=0)))
+    mfcc = librosa.feature.mfcc(y=w, sr=sr, n_mfcc=13).mean(axis=1)
+    base = np.array([
+        float(np.sqrt(np.mean(w ** 2))),
+        float(librosa.feature.zero_crossing_rate(w).mean()),
+        float(librosa.feature.spectral_rolloff(y=w, sr=sr).mean()),
+        float(librosa.feature.spectral_bandwidth(y=w, sr=sr).mean()),
+        flux,
+        float(scipy_kurtosis(w, fisher=True)),
+    ], dtype=np.float32)
+    return np.concatenate([base, mfcc.astype(np.float32)])
+
+
+# ---------------------------------------------------------------------------
+# Model — must match the Phase 2b V4 checkpoint exactly
+# ---------------------------------------------------------------------------
+
+class AttentionPool2d(nn.Module):
+    def __init__(self, in_channels, out_size=(4, 4)):
+        super().__init__()
+        self.attn = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels // 8, kernel_size=1), nn.ReLU(),
+            nn.Conv2d(in_channels // 8, 1, kernel_size=1),
+        )
+        self.pool = nn.AdaptiveAvgPool2d(out_size)
+
+    def forward(self, x):
+        w = torch.softmax(self.attn(x).flatten(2), dim=-1)
+        return self.pool(x * w.view(x.shape[0], 1, x.shape[2], x.shape[3]))
+
+
 class MelCNN(nn.Module):
-    def __init__(self,num_classes=6):
+    def __init__(self, num_classes=6):
         super().__init__()
-        self.block1=nn.Sequential(nn.Conv2d(1,32,3,padding=1),nn.BatchNorm2d(32),nn.ReLU(),nn.MaxPool2d(2))
-        self.block2=nn.Sequential(nn.Conv2d(32,64,3,padding=1),nn.BatchNorm2d(64),nn.ReLU(),nn.MaxPool2d(2))
-        self.block3=nn.Sequential(nn.Conv2d(64,128,3,padding=1),nn.BatchNorm2d(128),nn.ReLU(),nn.MaxPool2d(2))
-        self.block4=nn.Sequential(nn.Conv2d(128,256,3,padding=1),nn.BatchNorm2d(256),nn.ReLU(),nn.AdaptiveAvgPool2d((4,4)))
-        self.fc1=nn.Linear(256*4*4,256); self.dropout=nn.Dropout(0.5); self.fc2=nn.Linear(256,num_classes)
-    def extract_features(self,x):
-        x=self.block1(x);x=self.block2(x);x=self.block3(x);x=self.block4(x)
-        return self.dropout(F.relu(self.fc1(torch.flatten(x,1))))
-    def forward(self,x): return self.fc2(self.extract_features(x))
+        self.block1 = nn.Sequential(nn.Conv2d(1,   32, 3, padding=1), nn.BatchNorm2d(32),  nn.ReLU(), nn.MaxPool2d(2))
+        self.block2 = nn.Sequential(nn.Conv2d(32,  64, 3, padding=1), nn.BatchNorm2d(64),  nn.ReLU(), nn.MaxPool2d(2))
+        self.block3 = nn.Sequential(nn.Conv2d(64, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(), nn.MaxPool2d(2))
+        self.block4 = nn.Sequential(nn.Conv2d(128, 256, 3, padding=1), nn.BatchNorm2d(256), nn.ReLU(),
+                                    AttentionPool2d(256, (4, 4)))
+        self.fc1 = nn.Linear(256 * 4 * 4, 256)
+        self.dropout = nn.Dropout(0.5)
+        self.head_main    = nn.Linear(256, num_classes)
+        self.head_machine = nn.Linear(256, 3)
+        self.head_fault   = nn.Linear(256, 1)
 
-class MFCCStream(nn.Module):
-    def __init__(self):
+    def extract_features(self, x):
+        x = self.block1(x); x = self.block2(x)
+        x = self.block3(x); x = self.block4(x)
+        return self.dropout(F.relu(self.fc1(torch.flatten(x, 1))))
+
+    def forward(self, x):
+        feat = self.extract_features(x)
+        return self.head_main(feat), self.head_machine(feat), self.head_fault(feat)
+
+
+class MelStatCNN(nn.Module):
+    def __init__(self, num_classes=6, stat_dim=19):
         super().__init__()
-        self.features=nn.Sequential(nn.Conv2d(3,32,3,padding=1),nn.BatchNorm2d(32),nn.ReLU(),nn.MaxPool2d(2),nn.Conv2d(32,64,3,padding=1),nn.BatchNorm2d(64),nn.ReLU(),nn.MaxPool2d(2),nn.AdaptiveAvgPool2d((4,4)))
-        self.fc=nn.Linear(64*4*4,128)
-    def forward(self,x): return F.relu(self.fc(torch.flatten(self.features(x),1)))
+        self.mel_stream  = MelCNN(num_classes)
+        self.stat_branch = nn.Sequential(
+            nn.Linear(stat_dim, 128), nn.BatchNorm1d(128), nn.ReLU(), nn.Dropout(0.5),
+            nn.Linear(128, 64), nn.ReLU(),
+        )
+        self.fc1     = nn.Linear(256 + 64, 256)
+        self.dropout = nn.Dropout(0.5)
+        self.head_main    = nn.Linear(256, num_classes)
+        self.head_machine = nn.Linear(256, 3)
+        self.head_fault   = nn.Linear(256, 1)
 
-class MelMFCCStatCNN(nn.Module):
-    def __init__(self,num_classes=6,stat_dim=5):
-        super().__init__()
-        self.mel_stream=MelCNN(num_classes); self.mfcc_stream=MFCCStream()
-        self.stat_branch=nn.Sequential(nn.Linear(stat_dim,64),nn.ReLU(),nn.Linear(64,32),nn.ReLU())
-        self.fc1=nn.Linear(256+128+32,256); self.dropout=nn.Dropout(0.4); self.fc2=nn.Linear(256,num_classes)
-    def forward(self,mel,mfcc,stat):
-        f_mel=self.mel_stream.extract_features(mel); f_mfcc=self.mfcc_stream(mfcc); f_stat=self.stat_branch(stat)
-        return self.fc2(self.dropout(F.relu(self.fc1(torch.cat([f_mel,f_mfcc,f_stat],dim=1)))))
+    def forward(self, mel, stat):
+        f_mel  = self.mel_stream.extract_features(mel)
+        f_stat = self.stat_branch(stat)
+        fused  = self.dropout(F.relu(self.fc1(torch.cat([f_mel, f_stat], dim=1))))
+        return self.head_main(fused), self.head_machine(fused), self.head_fault(fused)
 
-#  NUMERIC FILE SORTING 
-def numeric_key(path):
-    m=re.search(r"\d+",path.stem)
+
+# ---------------------------------------------------------------------------
+# Numeric file sorting: 1.wav < 2.wav < 10.wav (not lexicographic)
+# ---------------------------------------------------------------------------
+
+def _numeric_key(path):
+    m = re.search(r"\d+", path.stem)
     return int(m.group()) if m else 0
 
-#  MAIN ─
+
+# ---------------------------------------------------------------------------
+# Inference helper: two-pass per-machine stat normalization
+# ---------------------------------------------------------------------------
+
+def _predict(model, mel_t, stat_raw, scalers, device):
+    """
+    Two-pass prediction using per-machine scalers.
+
+    Pass 1: normalize stat with the average of all three machine scalers,
+            run the model to predict which machine the clip belongs to.
+    Pass 2: normalize stat with the predicted machine's own scaler,
+            run again to get the final class prediction.
+
+    This avoids needing the true machine label at inference time while still
+    benefiting from the per-machine normalization used during training.
+    """
+    # Build a global (averaged) scaler from the three machine scalers
+    global_mean = np.mean([s[0] for s in scalers], axis=0)
+    global_std  = np.mean([s[1] for s in scalers], axis=0)
+
+    # Pass 1 — predict machine identity
+    stat_g = torch.tensor(
+        (stat_raw - global_mean) / global_std, dtype=torch.float32
+    ).unsqueeze(0).to(device)
+    with torch.no_grad():
+        _, machine_logits, _ = model(mel_t, stat_g)
+    predicted_machine = int(machine_logits.argmax(1).item())
+
+    # Pass 2 — predict class using the predicted machine's scaler
+    mean, std = scalers[predicted_machine]
+    stat_m = torch.tensor(
+        (stat_raw - mean) / std, dtype=torch.float32
+    ).unsqueeze(0).to(device)
+    with torch.no_grad():
+        class_logits, _, _ = model(mel_t, stat_m)
+    return int(class_logits.argmax(1).item())
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python infer.py <data_directory>"); sys.exit(1)
+        print("Usage: python infer.py <data_directory>")
+        sys.exit(1)
 
     data_dir = pathlib.Path(sys.argv[1])
     if not data_dir.exists():
         raise SystemExit(f"Directory not found: {data_dir}")
 
+    if not MODEL_PATH.exists():
+        raise SystemExit(f"Model file not found: {MODEL_PATH}")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
 
-    # Load scaler
-    scaler_data   = pickle.load(open(SCALER_PATH,"rb"))
-    scaler_mean   = torch.tensor(scaler_data["mean"], dtype=torch.float32).to(device)
-    scaler_std    = torch.tensor(scaler_data["std"],  dtype=torch.float32).to(device)
-    stat_features = scaler_data["features"]
-    stat_dim      = len(stat_features)
+    # Load checkpoint — includes model weights, scalers, and feature metadata
+    ckpt    = torch.load(MODEL_PATH, map_location=device, weights_only=False)
+    scalers = ckpt["scalers"]          # list of (mean, std) per machine
+    stat_dim = ckpt.get("stat_dim", len(scalers[0][0]))
 
-    # Load model
-    ckpt  = torch.load(MODEL_PATH, map_location=device)
-    model = MelMFCCStatCNN(num_classes=6, stat_dim=stat_dim).to(device)
+    model = MelStatCNN(num_classes=6, stat_dim=stat_dim).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
-    print(f"Model loaded (stat_dim={stat_dim}, features={stat_features})")
 
-    preprocessor = AudioPreprocessor(PreprocessConfig())
-
-    # Get files in numeric order: 1.wav, 2.wav, 3.wav ...
+    # Collect wav files in numeric order: 1.wav, 2.wav, 3.wav ...
     wav_files = sorted(
-        [f for f in data_dir.iterdir() if f.suffix.lower()==".wav"],
-        key=numeric_key
+        [f for f in data_dir.iterdir() if f.suffix.lower() == ".wav"],
+        key=_numeric_key,
     )
-    print(f"Found {len(wav_files)} wav files")
 
-    results, times = [], []
+    results = []
+    times   = []
 
     for wav_path in wav_files:
-        # Start timer AFTER reading the file (as per spec)
-        waveform = preprocessor.preprocess(wav_path)
-        t_start  = time.perf_counter()
+        # ── Pure I/O: read file bytes into memory ──────────────────────────
+        raw_w, orig_sr = _load_audio(wav_path)
 
-        mel_t  = torch.tensor(compute_mel_spectrogram(waveform),  dtype=torch.float32).unsqueeze(0).to(device)
-        mfcc_t = torch.tensor(compute_mfcc(waveform),             dtype=torch.float32).unsqueeze(0).to(device)
-        stat_t = torch.tensor(compute_statistical_features(waveform, feature_names=stat_features), dtype=torch.float32).unsqueeze(0).to(device)
-        stat_t = (stat_t - scaler_mean) / scaler_std
+        # ── Start timer AFTER file read, before any processing ─────────────
+        t_start = time.perf_counter()
 
-        with torch.no_grad():
-            logits = model(mel_t, mfcc_t, stat_t)
-            pred   = int(logits.argmax(1).item())
+        # Preprocessing
+        waveform = preprocess(raw_w, orig_sr)
 
-        t_end   = time.perf_counter()
-        elapsed = t_end - t_start
+        # Feature extraction
+        mel_t = torch.tensor(compute_mel(waveform), dtype=torch.float32).unsqueeze(0).to(device)
+        stat  = compute_stat(waveform)
+
+        # Inference
+        pred = _predict(model, mel_t, stat, scalers, device)
+
+        t_end = time.perf_counter()
+        # ── End timer ──────────────────────────────────────────────────────
 
         results.append(pred)
-        times.append(elapsed)
+        times.append(t_end - t_start)
 
-    # Write results.txt
-    out_results = data_dir.parent / "results.txt"
-    with open(out_results, "w") as f:
+    # Write results.txt — one predicted label per line
+    with open("results.txt", "w") as f:
         for r in results:
             f.write(f"{r}\n")
 
-    # Write time.txt
-    out_times = data_dir.parent / "time.txt"
-    with open(out_times, "w") as f:
+    # Write time.txt — one elapsed time per line, rounded to 3 decimal places
+    with open("time.txt", "w") as f:
         for t in times:
             f.write(f"{t:.3f}\n")
-
-    print(f"results.txt → {out_results}")
-    print(f"time.txt    → {out_times}")
-    print("Done.")

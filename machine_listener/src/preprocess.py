@@ -36,7 +36,6 @@ class AugmentationConfig:
     random_crop_train: bool = True # randomise section to analyse 
 
     def __post_init__(self) -> None:
-        # checks before running lw 7aga doesn't run mn hena you screwed up
         _validate_probability(self.noise_prob, "noise_prob")
         _validate_probability(self.time_shift_prob, "time_shift_prob")
         _validate_probability(self.pitch_shift_prob, "pitch_shift_prob")

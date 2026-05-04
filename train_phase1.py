@@ -1,15 +1,3 @@
-"""
-Phase 1 — Mel-Spectrogram CNN Baseline
-
-Steps:
-  1. Scan wav files and CREATE the split file (split_indices_clean.json).
-     Phase 1 is the only script that creates the split — all other phases load it.
-  2. Pre-compute mel-spectrograms once (~15 min), then cached.
-  3. Train MelCNN for 20 epochs with CosineAnnealingLR.
-  4. Save best checkpoint to outputs/saved_models/phase1_best.pth.
-  5. Evaluate on the test set.
-"""
-
 import os
 import time
 import random
@@ -21,7 +9,7 @@ from torch.utils.data import DataLoader
 from concurrent.futures import ThreadPoolExecutor
 import matplotlib.pyplot as plt
 from sklearn.metrics import classification_report
-
+import tqdm
 from machine_listener.src.preprocess import AudioPreprocessor, PreprocessConfig, AugmentationConfig
 from machine_listener.src.dataset import scan_wav_files, SPLIT_DIR
 from machine_listener.src.features.mel_spectrogram import compute_mel_spectrogram
@@ -29,7 +17,6 @@ from machine_listener.src.models.cnn_baseline import MelCNN
 from machine_listener.src.split_utils import create_clean_split, load_clean_split
 import machine_listener.src.train_utils as utils
 
-# ── Config ────────────────────────────────────────────────────────────────────
 
 ROOT_DIR   = "Students"
 MODELS_DIR = "machine_listener/outputs/saved_models"
@@ -52,8 +39,6 @@ CLASS_NAMES = [
 ]
 
 print(f"Device: {DEVICE}")
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def spec_augment(mel, freq_mask=30, time_mask=15, n_freq=2, n_time=2):
     mel = mel.clone()
@@ -82,7 +67,6 @@ def _precompute_mel_one(args):
 
 
 def precompute_mel(paths, feats_dir, preprocessor, n_workers=4):
-    import tqdm
     feats_dir = pathlib.Path(feats_dir)
     feats_dir.mkdir(parents=True, exist_ok=True)
     already = sum(1 for i in range(len(paths)) if (feats_dir / f"{i:06d}.npy").exists())
@@ -114,11 +98,6 @@ class PrecomputedDataset(torch.utils.data.Dataset):
             mel = spec_augment(mel)
         return mel, torch.tensor(self.labels[ri], dtype=torch.long)
 
-
-# ── Step 1: scan files and CREATE the split ───────────────────────────────────
-# Phase 1 is the only script that calls create_clean_split.
-# Every subsequent phase loads the file that is written here.
-
 _scan_preprocessor = AudioPreprocessor(PreprocessConfig(
     target_sr=16000, default_duration_sec=2.75, trim_silence=True, normalize_mode="peak",
     augmentation=AugmentationConfig(enabled=False),
@@ -130,11 +109,7 @@ print(f"Found {len(ALL_PATHS)} files")
 create_clean_split(ALL_PATHS, ALL_LABELS, SPLIT_DIR)
 _splits = load_clean_split(SPLIT_DIR)
 
-# ── Step 2: pre-compute mel-specs (runs once, then cached) ───────────────────
-
 precompute_mel(ALL_PATHS, FEATS_DIR_MEL, _scan_preprocessor, n_workers=NUM_WORKERS)
-
-# ── Step 3: build datasets and loaders ───────────────────────────────────────
 
 train_ds = PrecomputedDataset(FEATS_DIR_MEL, ALL_LABELS, _splits["train"], augment=True)
 val_ds   = PrecomputedDataset(FEATS_DIR_MEL, ALL_LABELS, _splits["val"],   augment=False)
@@ -156,14 +131,10 @@ label_counts  = np.bincount([ALL_LABELS[i] for i in _splits["train"]], minlength
 class_weights = torch.tensor(1.0 / (label_counts + 1), dtype=torch.float32).to(DEVICE)
 print(f"Label counts: {label_counts}")
 
-# ── Step 4: model, optimizer, criterion ──────────────────────────────────────
-
 model     = MelCNN(num_classes=6).to(DEVICE)
 optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 criterion = nn.CrossEntropyLoss(weight=class_weights)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
-
-# ── Step 5: training loop ─────────────────────────────────────────────────────
 
 best_val_acc = 0.0
 history      = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
@@ -192,10 +163,6 @@ for epoch in range(1, EPOCHS + 1):
 
 print(f"\nBest validation accuracy: {best_val_acc:.4f}")
 
-# ── Step 6: test evaluation ───────────────────────────────────────────────────
-# Checkpoint keys: model_state_dict · optimizer_state_dict · epoch · val_acc
-# Loaded by train_phase2.py as PHASE1_CKPT.
-
 model, best_epoch, _ = utils.load_checkpoint(ckpt_path, model)
 
 t0 = time.time()
@@ -223,7 +190,6 @@ print(f"Estimated 10 000 files: {ms_per_sample * 10000 / 1000:.2f} s")
 
 utils.plot_confusion_matrix(test_preds, test_labels, CLASS_NAMES)
 
-# ── Training curves ───────────────────────────────────────────────────────────
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
 ax1.plot(history["train_loss"], label="train")
 ax1.plot(history["val_loss"],   label="val")

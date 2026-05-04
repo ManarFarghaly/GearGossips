@@ -1,26 +1,6 @@
 """
-Input : waveform  np.ndarray shape (44000,)  — already preprocessed by AudioPreprocessor
-Output: np.ndarray shape (1, 128, 84)         — ready for the 2-D CNN
-
-    - power_to_db: Convert a power spectrogram (amplitude squared) to decibel (dB) units
-        It shrinks big values and boosts small ones, so you can see everything, not just loud parts
-    - As SR is 16000, the max frequency is 8000 (half of SR), so we can ignore frequencies above that
-    - why n_mels or image length = 128 -> Balance: too small (e.g., 32) → lose detail , too large (e.g., 512) → noisy + heavy model
-        128 is a standard compromise in audio ML
-    - why image width or time frames = 84 -> This is number of time frames (image width) 
-    It depends on: [1 + (len(y) - n_fft) // hop_length]
-    so samples = 2.75 sec × 16 kHz ≈ 44000 samples ,so frames = 1+(44000 - 1024) // 512 ≈ 84 frames
-    - Shape transformation → (1, 128, 84) 
-    Why:
-        CNNs expect channels so 
-        1 = grayscale channel
-        128 = frequency axis
-        84 = time axis
-        
-Shape explanation:
-  1   → grayscale channel  (CNNs need an explicit channel dimension)
-  128 → mel frequency bins (n_mels)
-  84  → time frames        = 1 + (44000 - 1024) // 512  ≈ 84
+Mel-spectrogram feature extraction for the 2-D CNN models.
+Input: waveform (44000,) from AudioPreprocessor → Output: (1, 128, 84) float32 in [0, 1]
 """
 
 import librosa

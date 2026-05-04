@@ -1,6 +1,15 @@
+torch>=2.0
+torchvision>=0.15
+torchaudio>=2.0
 numpy>=1.23
 scipy>=1.10
 soundfile>=0.12
 librosa>=0.10
+scikit-learn>=1.2
+matplotlib>=3.7
+seaborn>=0.12
+tqdm>=4.65
 # Optional: enables denoising when PreprocessConfig.denoise=True
 noisereduce>=3.0
+# Optional: experiment tracking in Kaggle training scripts
+wandb>=0.15

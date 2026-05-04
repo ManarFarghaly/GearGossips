@@ -1,6 +1,6 @@
-# phase V4 
+
 """
-PHASE 1 — Mel-Spectrogram → 2D CNN
+PHASE 1 V4 — Mel-Spectrogram → 2D CNN
 ══════════════════════════════════════════════════════════════════════
 
 DIAGNOSIS from v2 results:

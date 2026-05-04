@@ -1,18 +1,3 @@
-"""
-Phase 2b stat feature ablation — local version
-Run from project root: python train_phase2b_ablation.py
-
-Same 5 configs as kaggle_phase2b_ablation.py. See that file for the full description.
-
-  A  mel_only    no stat branch — Phase 1 V2 fine-tuned (baseline)
-  B  basic_4     rms, zcr, rolloff, bandwidth
-  C  +kurtosis   basic_4 + kurtosis
-  D  +flux       basic_4 + spectral_flux
-  E  all_6       rms, zcr, rolloff, bandwidth, kurtosis, spectral_flux
-
-Requires phase1_v2_best.pth in MODELS_DIR (from train_phase1V2.py).
-"""
-
 import os, random, pathlib, time, pickle
 from dataclasses import dataclass
 import numpy as np
@@ -21,7 +6,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import f1_score, classification_report
-
+import tqdm
+from concurrent.futures import ThreadPoolExecutor
 from machine_listener.src.preprocess import AudioPreprocessor, PreprocessConfig, AugmentationConfig
 from machine_listener.src.dataset import scan_wav_files, SPLIT_DIR
 from machine_listener.src.features.mel_spectrogram import compute_mel_spectrogram
@@ -31,7 +17,6 @@ from machine_listener.src.models.cnn_mel_stat import MelStatCNNHier
 from machine_listener.src.split_utils import load_clean_split
 import machine_listener.src.train_utils as utils
 
-# ── Config ────────────────────────────────────────────────────────────────────
 
 ROOT_DIR    = "Students"
 MODELS_DIR  = "machine_listener/outputs/saved_models"
@@ -72,8 +57,6 @@ if not os.path.exists(PHASE1_CKPT):
     raise FileNotFoundError(
         f"Phase 1 V2 checkpoint not found at {PHASE1_CKPT}. Run train_phase1V2.py first.")
 
-# ── Ablation configs ──────────────────────────────────────────────────────────
-
 @dataclass
 class AblCfg:
     name:     str
@@ -90,8 +73,6 @@ CONFIGS = [
 def feat_indices(features):
     return [ALL_STAT.index(f) for f in features]
 
-# ── SpecAugment ───────────────────────────────────────────────────────────────
-
 def spec_augment(mel, freq_mask=27, time_mask=15, n_freq=2, n_time=2):
     mel = mel.clone()
     _, F, T = mel.shape
@@ -105,11 +86,8 @@ def spec_augment(mel, freq_mask=27, time_mask=15, n_freq=2, n_time=2):
         mel[:, :, t0:t0+t] = 0.0
     return mel
 
-# ── Pre-computation ───────────────────────────────────────────────────────────
 
 def precompute_all(paths, mel_dir, stat_dir, preprocessor, n_workers=4):
-    import tqdm
-    from concurrent.futures import ThreadPoolExecutor
     mel_dir  = pathlib.Path(mel_dir);  mel_dir.mkdir(parents=True, exist_ok=True)
     stat_dir = pathlib.Path(stat_dir); stat_dir.mkdir(parents=True, exist_ok=True)
 
@@ -137,13 +115,11 @@ def precompute_all(paths, mel_dir, stat_dir, preprocessor, n_workers=4):
     else:
         print(f"All {len(paths)} mel+stat features cached.")
 
-# ── Scaler ────────────────────────────────────────────────────────────────────
 
 def fit_scaler(stat_dir, indices, fidx):
     arr = np.stack([np.load(pathlib.Path(stat_dir) / f"{i:06d}.npy")[fidx] for i in indices])
     return arr.mean(0), arr.std(0) + 1e-8
 
-# ── Weight loading ────────────────────────────────────────────────────────────
 
 def load_v2_weights(model, ckpt_path, device):
     """Load Phase 1 V2 backbone (flat head) — backbone keys load, head keys are ignored."""
@@ -159,7 +135,6 @@ def load_v2_weights(model, ckpt_path, device):
         missing, _ = model.load_state_dict(p1_state, strict=False)
         print(f"[ckpt] Loaded {len(p1_state)-len(missing)}/{len(p1_state)} keys.")
 
-# ── Loss / weights ────────────────────────────────────────────────────────────
 
 class BinaryFocalLoss(nn.Module):
     def __init__(self, gamma=2.0, pos_weight=None):
@@ -191,7 +166,6 @@ def build_losses(label_counts, device):
             nn.CrossEntropyLoss(weight=mw),
             BinaryFocalLoss(gamma=FOCAL_GAMMA, pos_weight=fpw))
 
-# ── Mixup ─────────────────────────────────────────────────────────────────────
 
 def mixup_batch(x, y, device):
     lam  = float(np.random.beta(MIXUP_ALPHA, MIXUP_ALPHA))
@@ -202,7 +176,6 @@ def mixup_batch(x, y, device):
 def mixup_loss(crit, pred, ya, yb, lam):
     return lam * crit(pred, ya) + (1-lam) * crit(pred, yb)
 
-# ── Datasets ──────────────────────────────────────────────────────────────────
 
 class MelOnlyDataset(Dataset):
     def __init__(self, mel_dir, labels, indices, augment=False):
@@ -242,7 +215,6 @@ class MelStatDataset(Dataset):
                 torch.tensor(_MACHINE_FROM_CLASS[lbl], dtype=torch.long),
                 torch.tensor(_FAULT_FROM_CLASS[lbl],   dtype=torch.long))
 
-# ── Train / eval ──────────────────────────────────────────────────────────────
 
 def train_epoch_mel(model, loader, optimizer, crit_main, crit_machine, crit_fault, device):
     model.train()
@@ -363,8 +335,6 @@ def run_training(model, tr_ldr, vl_ldr, optimizer,
         if es >= ES_PATIENCE:
             print(f"  Early stop at epoch {epoch}."); break
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-
 _infer_prep = AudioPreprocessor(PreprocessConfig(
     target_sr=16000, default_duration_sec=2.75,
     augmentation=AugmentationConfig(enabled=False),
@@ -457,7 +427,6 @@ for cfg in CONFIGS:
             pickle.dump({"mean": sm, "std": ss, "features": cfg.features}, fh)
         print(f"  Scaler saved → {pkl_path}")
 
-# ── Summary table ─────────────────────────────────────────────────────────────
 
 print(f"\n{'Config':<16} {'M1N':>5} {'M1A':>5} {'M2N':>5} {'M2A':>5} {'M3N':>5} {'M3A':>5} {'Macro':>7} {'Acc':>6}")
 print("-" * 68)
